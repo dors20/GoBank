@@ -1,0 +1,47 @@
+syntax = "proto3";
+
+package api;
+
+option go_package = "2PC/server/api;api";
+
+message ReadOnlyPayload {
+  string key = 1;
+}
+
+message ReadOnlyResponse {
+  bytes value = 1;
+  bool found = 2;
+  string error = 3;
+}
+
+message IntraShardRWPayload {
+  string key = 1;
+  bytes value = 2;
+  bool delete = 3;
+}
+
+message IntraShardRWResp {
+  bytes value = 1;
+  bool found = 2;
+  string error = 3;
+}
+
+message InterShardRWPayload {
+  string key = 1;
+  bytes value = 2;
+  bool delete = 3;
+}
+
+message InterShardRWResp {
+  bytes value = 1;
+  bool found = 2;
+  string error = 3;
+}
+
+service KV {
+  rpc ReadOnlyRequest(ReadOnlyPayload) returns (ReadOnlyResponse);
+  rpc IntraShardRWReq(IntraShardRWPayload) returns (IntraShardRWResp);
+  rpc InterShardRWReq(InterShardRWPayload) returns (InterShardRWResp);
+}
+
+
