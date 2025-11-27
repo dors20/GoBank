@@ -38,10 +38,108 @@ message InterShardRWResp {
   string error = 3;
 }
 
+message Message {
+  int32 sender = 1;
+  int32 receiver = 2;
+  int32 amount = 3;
+  int64 timestamp = 4;
+  string client_id = 5;
+}
+
+message Reply {
+  int32 ballot_val = 1;
+  int32 server_id = 2;
+  int64 timestamp = 3;
+  string client_id = 4;
+  bool result = 5;
+}
+
+message LogRecord {
+  int32 seq_num = 1;
+  int32 ballot_val = 2;
+  int32 server_id = 3;
+  int32 sender = 4;
+  int32 receiver = 5;
+  int32 amount = 6;
+  int64 timestamp = 7;
+  bool is_committed = 8;
+}
+
+message AcceptResp {
+  bool success = 1;
+  int32 node_id = 2;
+  LogRecord record = 3;
+}
+
+message Blank {}
+
+message PrepareReq {
+  int32 ballot_val = 1;
+  int32 server_id = 2;
+}
+
+message PromiseResp {
+  bool success = 1;
+  int32 ballot_val = 2;
+  int32 server_id = 3;
+  repeated LogRecord accept_log = 4;
+}
+
+message NewViewReq {
+  int32 ballot_val = 1;
+  int32 server_id = 2;
+  repeated LogRecord accept_log = 3;
+}
+
+message Logs {
+  repeated LogRecord logs = 1;
+}
+
+message Vault {
+  map<string, int32> vault = 1;
+}
+
+message RequestInfo {
+  int32 seq_num = 1;
+}
+
+enum TxnState {
+  TXN_STATE_UNKNOWN = 0;
+  TXN_STATE_ACCEPTED = 1;
+  TXN_STATE_COMMITTED = 2;
+  TXN_STATE_EXECUTED = 3;
+}
+
+message Status {
+  TxnState status = 1;
+}
+
+message ViewLogs {
+  repeated NewViewReq views = 1;
+}
+
 service KV {
   rpc ReadOnlyRequest(ReadOnlyPayload) returns (ReadOnlyResponse);
   rpc IntraShardRWReq(IntraShardRWPayload) returns (IntraShardRWResp);
   rpc InterShardRWReq(InterShardRWPayload) returns (InterShardRWResp);
+}
+
+service ClientServerTxns {
+  rpc Request(Message) returns (Reply);
+}
+
+service PaxosReplication {
+  rpc Accept(LogRecord) returns (AcceptResp);
+  rpc Commit(LogRecord) returns (Blank);
+  rpc Prepare(PrepareReq) returns (PromiseResp);
+  rpc NewView(NewViewReq) returns (Blank);
+}
+
+service PaxosPrintInfo {
+  rpc PrintLog(Blank) returns (Logs);
+  rpc PrintDB(Blank) returns (Vault);
+  rpc PrintStatus(RequestInfo) returns (Status);
+  rpc PrintView(Blank) returns (ViewLogs);
 }
 
 

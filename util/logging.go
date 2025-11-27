@@ -2,6 +2,7 @@ package util
 
 import (
 	"os"
+	"path/filepath"
 
 	"go.uber.org/zap"
 	"go.uber.org/zap/zapcore"
@@ -35,6 +36,15 @@ func NewLogger(cfg LoggerConfig) (*zap.Logger, error) {
 	if logFileName == "" {
 		logFileName = "logs/server_" + cfg.ServerID + ".log"
 	}
+
+	dir := filepath.Dir(logFileName)
+	if dir != "." {
+		err := os.MkdirAll(dir, 0o755)
+		if err != nil {
+			return nil, err
+		}
+	}
+
 	logFile, err := os.OpenFile(logFileName, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644)
 	if err != nil {
 		return nil, err
