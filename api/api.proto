@@ -1,0 +1,112 @@
+syntax = "proto3";
+
+package api;
+
+option go_package = "/api";
+
+service ClientServerTxns {
+    rpc Request(Message) returns (Reply);
+    rpc SimulateNodeFailure(Blank) returns (Blank);
+    rpc SimulateLeaderFailure(Blank) returns (Blank);
+    rpc RecoverNode(Blank) returns (Blank);
+}
+
+service PaxosReplication {
+    rpc Accept(LogRecord) returns (AcceptResp);
+    rpc Commit(LogRecord) returns (Blank);
+    rpc Prepare(PrepareReq) returns (PromiseResp);
+    rpc NewView(NewViewReq) returns (Blank);
+}
+
+service PaxosPrintInfo {
+    rpc PrintLog(Blank) returns (Logs);
+
+    rpc PrintDB(Blank) returns (Vault);
+
+    rpc PrintStatus(RequestInfo) returns (Status);
+
+    //TODO after consensus is implemented
+    rpc PrintView(Blank) returns (ViewLogs);
+}
+
+message Message {
+    string sender = 1;
+    string receiver = 2;
+    int32 amount = 3;
+    int64 timestamp = 4;
+    string clientId = 5;
+}
+
+message Reply {
+    int32 ballotVal = 1;
+    int32 serverId = 2;
+    int64 timestamp = 3;
+    string clientId = 4;
+    bool result = 5;
+    string error = 6;
+}
+
+
+message AcceptResp {
+    LogRecord record =1;
+    int32 nodeID = 2;
+    bool success = 3;
+}
+
+message Blank{}
+
+message LogRecord {
+    int32 seqNum = 1;
+    int32 ballotVal = 2;
+    int32 serverId = 3;
+    string sender = 4;
+    string receiver = 5;
+    int32 amount = 6;
+    bool isCommitted = 7;
+    int64 timestamp = 8;
+}
+
+message Logs {
+    repeated LogRecord logs = 1;
+}
+
+message Vault {
+    map<string, int32> vault =1;
+}
+
+message RequestInfo {
+    int32 seqNum = 1;
+}
+
+enum TxnState {
+    NOSTATUS = 0;
+    ACCEPTED = 1;
+    COMMITTED = 2;
+    EXECUTED = 3;
+}
+
+message Status {
+    TxnState status = 1;
+}
+
+message PrepareReq {
+    int32 ballotVal = 1;
+    int32 serverId = 2;
+}
+
+message PromiseResp {
+    int32 ballotVal = 1;
+    int32 serverId = 2; 
+    bool success = 3;
+    repeated LogRecord acceptLog = 4; 
+}
+
+message NewViewReq {
+    int32 ballotVal = 1;
+    int32 serverId = 2; 
+    repeated LogRecord acceptLog = 3; 
+}
+
+message ViewLogs {
+    repeated NewViewReq views = 1;
+}
