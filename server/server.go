@@ -104,6 +104,8 @@ type ServerImpl struct {
 	isPromised      bool
 	isRunning       bool
 	switchLock      sync.Mutex
+	logFetchLock    sync.Mutex
+	logFetchRunning bool
 	api.UnimplementedClientServerTxnsServer
 	api.UnimplementedPaxosPrintInfoServer
 	api.UnimplementedPaxosReplicationServer
@@ -161,21 +163,17 @@ func startServer(id int, t time.Duration) {
 	pm := &PeerManager{
 		peers: make(map[int]*Peer),
 	}
-	// TODO remove after implementing leader election
 	s := constants.Follower
-	// if id == 1 {
-	// 	s = constants.Leader
-	// }
 
 	server = &ServerImpl{
 		id:              id,
 		ballot:          &BallotNumber{BallotVal: 1, ServerID: id},
 		seqNum:          0,
 		leaderTimer:     time.NewTimer(t),
-		state:           s, // TODO: Default state should be follower , Change to Leader for testing
+		state:           s,
 		clientManager:   cm,
 		peerManager:     pm,
-		leaderBallot:    &BallotNumber{BallotVal: 0, ServerID: 0}, // TODO: Maybe make  it <1,server_id> Note : We will on the first happy path always elect <1,5>
+		leaderBallot:    &BallotNumber{BallotVal: 0, ServerID: 0},
 		leaderPulse:     make(chan bool, 1),
 		viewLog:         make([]*api.NewViewReq, 0),
 		tp:              constants.PREPARE_TIMEOUT * time.Millisecond,
@@ -183,12 +181,23 @@ func startServer(id int, t time.Duration) {
 		pendingPrepares: make(map[string]*api.PrepareReq),
 		isRunning:       true,
 	}
+	if id == 1 {
+		server.state = constants.Leader
+		server.ballot.BallotVal = 1
+		server.ballot.ServerID = 1
+		server.leaderBallot.BallotVal = 1
+		server.leaderBallot.ServerID = 1
+	} else {
+		server.leaderBallot.BallotVal = 1
+		server.leaderBallot.ServerID = 1
+	}
 	server.port = constants.ServerPorts[id]
 	server.peerManager.initPeerConnections(server.id) // Note - not doing as a singleton on becoming first time leader for simplicity
 	logStore.unmarshal()
 	sm.startExec()
 	go server.monitorLeader()
 	go server.startHeartbeat()
+	go server.logCatchupLoop()
 	logs.Infof("Server Initialized successfully with serverId: %d and timer duration: %d", id, t)
 }
 
@@ -267,12 +276,6 @@ func (s *ServerImpl) Request(ctx context.Context, in *api.Message) (*api.Reply, 
 		logs.Infof("First request from client %s. Creating client cache", in.ClientId)
 	}
 
-	// if in.GetTimestamp() < client.lastRequestTimeStamp {
-	// 	logs.Warnf("Recieved a stale request from client-%s", in.ClientId)
-	// 	s.clientManager.lock.Unlock()
-	// 	return &api.Reply{Result: false, ServerId: int32(s.id), Error: "Invalid stale request"}, nil
-	// }
-
 	if in.GetTimestamp() <= client.lastRequestTimeStamp {
 		logs.Infof("Recieved duplicate request from client-%s", in.ClientId)
 		resp := client.lastResponse
@@ -284,7 +287,6 @@ func (s *ServerImpl) Request(ctx context.Context, in *api.Message) (*api.Reply, 
 		return resp, nil
 	}
 	client.lastRequestTimeStamp = in.GetTimestamp()
-	//client.lastResponse = nil
 	s.clientManager.lock.Unlock()
 
 	s.lock.Lock()
@@ -405,17 +407,18 @@ func (sm *StateMachine) execCommitLogs() {
 	logs.Debug("Start")
 	defer logs.Debug("Exit")
 
-	logStore.lock.Lock()
-	sm.lock.Lock()
-	defer sm.lock.Unlock()
-	defer logStore.lock.Unlock()
-
 	for {
+		logStore.lock.Lock()
+		sm.lock.Lock()
 		nextCommitIdx := sm.lastExecutedCommitNum + 1
 		logToApply, ok := logStore.records[nextCommitIdx]
-
 		if !ok || !logToApply.IsCommitted {
-			break
+			sm.lock.Unlock()
+			logStore.lock.Unlock()
+			if server != nil {
+				server.startLogCatchup()
+			}
+			return
 		}
 		sender := logToApply.Txn.Sender
 		reciever := logToApply.Txn.Reciever
@@ -446,9 +449,9 @@ func (sm *StateMachine) execCommitLogs() {
 			close(execChan)
 			delete(sm.executionStatus, logToApply.SeqNum)
 		}
-
+		sm.lock.Unlock()
+		logStore.lock.Unlock()
 	}
-
 }
 
 func (ls *LogStore) append(record *LogRecord) {
@@ -655,7 +658,7 @@ func (pm *PeerManager) broadcastAccept(quoram int, record *LogRecord, timestamp 
 	case <-qourumChan:
 		logs.Infof("Qouram achieved for seqNum %d", record.SeqNum)
 		return true
-	case <-time.After(constants.REQUEST_TIMEOUT * time.Second):
+	case <-time.After(constants.REQUEST_TIMEOUT * time.Millisecond):
 		logs.Warnf("Quorum not achieved for seqNum %d. Timed out. Recieved voted %d, needed %d", record.SeqNum, acceptedVotes, quoram)
 		return false
 	}
@@ -1337,7 +1340,20 @@ func (s *ServerImpl) startHeartbeat() {
 	}
 }
 
+func (s *ServerImpl) logCatchupLoop() {
+	ticker := time.NewTicker(500 * time.Millisecond)
+	defer ticker.Stop()
+
+	for range ticker.C {
+		if !s.isServerRunning() {
+			continue
+		}
+		s.startLogCatchup()
+	}
+}
+
 func (ls *LogStore) marshal() {
+	return
 	logs.Debug("Enter")
 	defer logs.Debug("Exit")
 	ls.lock.Lock()
@@ -1359,7 +1375,7 @@ func (ls *LogStore) marshal() {
 }
 
 func (ls *LogStore) unmarshal() {
-
+	return
 	logs.Debug("enter")
 	defer logs.Debug("Exit")
 
@@ -1403,6 +1419,121 @@ func (ls *LogStore) unmarshal() {
 		server.seqNum = maxSeq
 	}
 	logs.Infof("Successfully loaded %d records from log file %s. Max seqNum set to %d.", len(ls.records), filePath, maxSeq)
+}
+
+func (s *ServerImpl) startLogCatchup() {
+	s.logFetchLock.Lock()
+	if s.logFetchRunning || !s.isServerRunning() {
+		s.logFetchLock.Unlock()
+		return
+	}
+	s.logFetchRunning = true
+	s.logFetchLock.Unlock()
+
+	go func() {
+		defer func() {
+			s.logFetchLock.Lock()
+			s.logFetchRunning = false
+			s.logFetchLock.Unlock()
+		}()
+
+		if !s.isServerRunning() {
+			return
+		}
+
+		sm.lock.Lock()
+		nextSeq := sm.lastExecutedCommitNum + 1
+		sm.lock.Unlock()
+
+		logStore.lock.Lock()
+		maxCommitted := 0
+		for seq, rec := range logStore.records {
+			if rec.IsCommitted && seq > maxCommitted {
+				maxCommitted = seq
+			}
+		}
+		if maxCommitted <= nextSeq {
+			logStore.lock.Unlock()
+			return
+		}
+		missing := make([]int, 0)
+		for seq := nextSeq; seq <= maxCommitted; seq++ {
+			rec, ok := logStore.records[seq]
+			if !ok || !rec.IsCommitted {
+				missing = append(missing, seq)
+			}
+		}
+		logStore.lock.Unlock()
+		if len(missing) == 0 {
+			return
+		}
+
+		for _, target := range missing {
+			if !s.isServerRunning() {
+				return
+			}
+			var pulled *api.LogRecord
+			for id := 1; id <= constants.MAX_NODES; id++ {
+				if id == s.id {
+					continue
+				}
+				p, ok := s.peerManager.peers[id]
+				if !ok || p.conn == nil {
+					continue
+				}
+				client := api.NewPaxosPrintInfoClient(p.conn)
+				ctx, cancel := context.WithTimeout(context.Background(), constants.REQUEST_TIMEOUT*time.Millisecond)
+				resp, err := client.PrintLog(ctx, &api.Blank{})
+				cancel()
+				if err != nil {
+					continue
+				}
+				for _, r := range resp.GetLogs() {
+					if int(r.GetSeqNum()) == target && r.GetIsCommitted() {
+						pulled = r
+						break
+					}
+				}
+				if pulled != nil {
+					break
+				}
+			}
+			if pulled == nil {
+				continue
+			}
+
+			logStore.lock.Lock()
+			rec, ok := logStore.records[target]
+			if ok {
+				if rec.IsCommitted || rec.IsExecuted {
+					logStore.lock.Unlock()
+					continue
+				}
+				rec.Ballot = &BallotNumber{BallotVal: int(pulled.BallotVal), ServerID: int(pulled.ServerId)}
+				rec.Txn = &ClientRequestTxn{
+					Sender:   pulled.Sender,
+					Reciever: pulled.Receiver,
+					Amount:   int(pulled.Amount),
+				}
+				rec.IsCommitted = true
+			} else {
+				logStore.records[target] = &LogRecord{
+					SeqNum: target,
+					Ballot: &BallotNumber{BallotVal: int(pulled.BallotVal), ServerID: int(pulled.ServerId)},
+					Txn: &ClientRequestTxn{
+						Sender:   pulled.Sender,
+						Reciever: pulled.Receiver,
+						Amount:   int(pulled.Amount),
+					},
+					IsCommitted: true,
+				}
+			}
+			logStore.lock.Unlock()
+			go logStore.marshal()
+		}
+
+		sm.applyTxn()
+	}()
 }
 
 // func (sm *StateMachine) marshalSnapshot() {

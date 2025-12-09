@@ -79,8 +79,9 @@ func main() {
 	logs.Info("Server Binary built")
 
 	sm = &serversData{
-		servers:    make(map[int]*serverInfo),
-		currLeader: constants.MAX_NODES,
+		servers: make(map[int]*serverInfo),
+		// currLeader: constants.MAX_NODES,
+		currLeader: 1,
 	}
 
 	clientStateManager = make(map[string]*clientState)
@@ -124,14 +125,13 @@ func main() {
 
 	logs.Info("Waiting for servers to start")
 	fmt.Println("Waiting for servers to start")
-	time.Sleep(1 * time.Second)
+	time.Sleep(2 * time.Second)
 
 	logs.Info("Running test Cases")
 	testSets, err := parseTestCases(testFilePath)
 	if err != nil {
 		logs.Fatalf("Failed to parse test cases from '%s': %v", testFilePath, err)
 	}
-	// run()
 	runCLI(testSets)
 	printServerStatus()
 	logs.Info("Completed all test cases")
@@ -314,6 +314,7 @@ func executeTestSet(ts TestSet) {
 
 	logs.Debug("Enter")
 	defer logs.Debug("Exit")
+	start := time.Now()
 	recoverServer(ts.LiveNodes)
 
 	logs.Infof("--- Executing Test Set %d ---", ts.SetNumber)
@@ -373,6 +374,8 @@ func executeTestSet(ts TestSet) {
 	}
 	wg.Wait()
 	logs.Infof("--- Finished Test Set %d ---", ts.SetNumber)
+	elapsed := time.Since(start)
+	fmt.Printf("Test Set %d completed in %v\n", ts.SetNumber, elapsed)
 	printViewAll()
 }
 
@@ -396,29 +399,36 @@ func makeRequest(sender, receiver string, amount int) {
 		Timestamp: txnID,
 	}
 
+	for i := 0; i < 20; i++ {
+		reply := sendWithRetryOnce(req)
+		if reply != nil && !strings.Contains(reply.Error, "NOT_LEADER") {
+			logs.Infof("Request %s- tnx-%d completed. Leader is %d. Result: %t", sender, txnID, reply.ServerId, reply.Result)
+			sm.lock.Lock()
+			sm.currLeader = int(reply.ServerId)
+			sm.lock.Unlock()
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+func sendWithRetryOnce(req *api.Message) *api.Reply {
 	sm.lock.Lock()
 	leaderID := sm.currLeader
 	sm.lock.Unlock()
+
 	client, err := sm.getClientServerConn()
-	if err != nil {
-		logs.Warnf("Could not get client for leader %d, attempting broadcast.", leaderID)
-		broadcastRequest(req)
-		return
+	if err == nil {
+		ctx, cancel := context.WithTimeout(context.Background(), constants.REQUEST_TIMEOUT*time.Millisecond)
+		reply, errReq := client.Request(ctx, req)
+		cancel()
+		if errReq == nil && reply != nil && !strings.Contains(reply.Error, "NOT_LEADER") {
+			return reply
+		}
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), constants.REQUEST_TIMEOUT*time.Millisecond)
-	defer cancel()
-
-	reply, err := client.Request(ctx, req)
-	if err != nil || (reply != nil && strings.Contains(reply.Error, "NOT_LEADER")) {
-		logs.Warnf("Request to leader %d failed or was rejected. Broadcasting to all servers.", leaderID)
-		broadcastRequest(req)
-	} else if reply != nil {
-		logs.Infof("Request %s- tnx-%d successful. Leader is %d. Result: %t", sender, txnID, reply.ServerId, reply.Result)
-		sm.lock.Lock()
-		sm.currLeader = int(reply.ServerId)
-		sm.lock.Unlock()
-	}
+	logs.Warnf("Request to leader %d failed or was rejected. Broadcasting to all servers.", leaderID)
+	return broadcastRequest(req)
 }
 
 func broadcastRequest(req *api.Message) *api.Reply {
@@ -435,8 +445,11 @@ func broadcastRequest(req *api.Message) *api.Reply {
 			}
 			ctx, cancel := context.WithTimeout(context.Background(), constants.REQUEST_TIMEOUT*time.Millisecond)
 			defer cancel()
-			if reply, err := client.Request(ctx, req); err == nil && reply != nil && !strings.Contains(reply.Error, "NOT_LEADER") && reply.Result == true {
-				replyChan <- reply
+			if reply, err := client.Request(ctx, req); err == nil && reply != nil && !strings.Contains(reply.Error, "NOT_LEADER") {
+				select {
+				case replyChan <- reply:
+				default:
+				}
 			}
 		}(id)
 	}
@@ -562,7 +575,7 @@ func printReqStatus(serverID, seqNum int) {
 		logs.Warnf("PrintStatus failed: %v", err)
 	} else {
 		logs.Infof("*PRINTSTATUS* Server %d Status for Seq #%d: %s", serverID, seqNum, status.GetStatus().String())
-		//fmt.Printf("*PRINTSTATUS* Server %d Status for Seq #%d: %s", serverID, seqNum, status.GetStatus().String())
+		fmt.Printf("*PRINTSTATUS* Server %d Status for Seq #%d: %s\n", serverID, seqNum, status.GetStatus().String())
 	}
 
 }
@@ -584,7 +597,7 @@ func printDb(serverID int) {
 		logs.Warnf("PrintDB failed: %v", err)
 	} else {
 		logs.Infof("*PRINT DB* Server %d Vault: %v", serverID, db.GetVault())
-		//fmt.Printf("*PRINT DB* Server %d Vault: %v", serverID, db.GetVault())
+		fmt.Printf("*PRINT DB* Server %d Vault: %v\n", serverID, db.GetVault())
 	}
 }
 
@@ -604,10 +617,10 @@ func printlog(serverID int) {
 		logs.Warnf("PrintLog failed: %v", err)
 	} else {
 		logs.Infof("Server %d Log:", serverID)
-		//fmt.Printf("Server %d Log:", serverID)
+		fmt.Printf("Server %d Log:", serverID)
 		for _, entry := range logStore.GetLogs() {
 			logs.Infof("*PRINT LOGS* - Seq: %d, From: %s, To: %s, Amt: %d, Committed: %t, ballotVal: %d, serverID: %d", entry.GetSeqNum(), entry.GetSender(), entry.GetReceiver(), entry.GetAmount(), entry.GetIsCommitted(), entry.GetBallotVal(), entry.ServerId)
-			//fmt.Printf("*PRINT LOGS* - Seq: %d, From: %s, To: %s, Amt: %d, Committed: %t, ballotVal: %d, serverID: %d", entry.GetSeqNum(), entry.GetSender(), entry.GetReceiver(), entry.GetAmount(), entry.GetIsCommitted(), entry.GetBallotVal(), entry.ServerId)
+			fmt.Printf("*PRINT LOGS* - Seq: %d, From: %s, To: %s, Amt: %d, Committed: %t, ballotVal: %d, serverID: %d\n", entry.GetSeqNum(), entry.GetSender(), entry.GetReceiver(), entry.GetAmount(), entry.GetIsCommitted(), entry.GetBallotVal(), entry.ServerId)
 		}
 	}
 }
