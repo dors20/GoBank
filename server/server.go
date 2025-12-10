@@ -69,6 +69,7 @@ type StateMachine struct {
 type Client struct {
 	lastRequestTimeStamp int64
 	lastResponse         *api.Reply
+	pendingReply         chan *api.Reply
 }
 
 // maps unique client id to their request and last served timestamp
@@ -490,10 +491,6 @@ func (s *ServerImpl) Request(ctx context.Context, in *api.Message) (*api.Reply, 
 
 	logs.Debug("Entry")
 	defer logs.Debug("Exit")
-	if !s.isServerRunning() {
-		return &api.Reply{Result: false, ServerId: int32(s.id), Error: "SERVER_DOWN"}, s.downErr()
-	}
-
 	logs.Infof("Received transaction from %s to %s for amount %d", in.Sender, in.Receiver, in.Amount)
 
 	// TODO leader forward
@@ -502,6 +499,7 @@ func (s *ServerImpl) Request(ctx context.Context, in *api.Message) (*api.Reply, 
 	// Exact once semantics before the leader check other wise on failed req, all nodes will flood Leader
 	// Changed exactly once semantics from lastReply to lastReq because of one observed duplicated exec
 	// Scenario is if client sends a req and the req takes too long to process because of network delay and the client retries, then both the reqs can be executed
+	reqTS := in.GetTimestamp()
 	s.clientManager.lock.Lock()
 	client, ok := s.clientManager.clientList[in.ClientId]
 	if !ok {
@@ -509,15 +507,64 @@ func (s *ServerImpl) Request(ctx context.Context, in *api.Message) (*api.Reply, 
 		s.clientManager.clientList[in.ClientId] = client
 		logs.Infof("First request from client %s. Creating client cache", in.ClientId)
 	}
-
-	if in.GetTimestamp() <= client.lastRequestTimeStamp && client.lastResponse != nil {
-		logs.Infof("Recieved duplicate request from client-%s", in.ClientId)
+	if reqTS < client.lastRequestTimeStamp {
 		resp := client.lastResponse
 		s.clientManager.lock.Unlock()
 		return resp, nil
 	}
-	client.lastRequestTimeStamp = in.GetTimestamp()
+	if reqTS == client.lastRequestTimeStamp {
+		if client.lastResponse != nil {
+			resp := client.lastResponse
+			s.clientManager.lock.Unlock()
+			return resp, nil
+		}
+		if client.pendingReply != nil {
+			pending := client.pendingReply
+			s.clientManager.lock.Unlock()
+			select {
+			case resp, ok := <-pending:
+				if ok && resp != nil {
+					return resp, nil
+				}
+				return &api.Reply{Result: false, ServerId: int32(s.id), Error: "RETRY"}, nil
+			case <-ctx.Done():
+				return nil, ctx.Err()
+			}
+		}
+	}
+	client.lastRequestTimeStamp = reqTS
+	client.lastResponse = nil
+	client.pendingReply = make(chan *api.Reply, 1)
 	s.clientManager.lock.Unlock()
+
+	isRetryable := func(errStr string) bool {
+		return errStr == "NOT_LEADER" || errStr == "SERVER_DOWN" || errStr == "RETRY" || errStr == "LOCK_CONFLICT"
+	}
+
+	finish := func(resp *api.Reply, err error) (*api.Reply, error) {
+		s.clientManager.lock.Lock()
+		if c, exists := s.clientManager.clientList[in.ClientId]; exists && c.lastRequestTimeStamp == reqTS {
+			if resp != nil && isRetryable(resp.Error) {
+				c.lastResponse = nil
+			} else {
+				c.lastResponse = resp
+			}
+			if c.pendingReply != nil {
+				select {
+				case c.pendingReply <- resp:
+				default:
+				}
+				close(c.pendingReply)
+				c.pendingReply = nil
+			}
+		}
+		s.clientManager.lock.Unlock()
+		return resp, err
+	}
+
+	if !s.isServerRunning() {
+		return finish(&api.Reply{Result: false, ServerId: int32(s.id), Error: "SERVER_DOWN"}, s.downErr())
+	}
 
 	s.lock.Lock()
 	if s.state != constants.Leader {
@@ -527,7 +574,7 @@ func (s *ServerImpl) Request(ctx context.Context, in *api.Message) (*api.Reply, 
 		// Before first election or after recieving prepare from higher ballot
 		if leaderID == 0 || leaderID == s.id {
 			logs.Warnf("Cannot process this transaction, not current cluster leader and leader is unknown.")
-			return &api.Reply{Result: false, ServerId: int32(s.id), Error: "NOT_LEADER"}, nil
+			return finish(&api.Reply{Result: false, ServerId: int32(s.id), Error: "NOT_LEADER"}, nil)
 		}
 
 		logs.Infof("Forwarding request to perceived leader: %d", leaderID)
@@ -537,20 +584,29 @@ func (s *ServerImpl) Request(ctx context.Context, in *api.Message) (*api.Reply, 
 
 		if !ok {
 			logs.Warnf("No connection found for leader %d", leaderID)
-			return &api.Reply{Result: false, ServerId: int32(s.id), Error: "NOT_LEADER"}, nil
+			return finish(&api.Reply{Result: false, ServerId: int32(s.id), Error: "NOT_LEADER"}, nil)
 		}
 
 		client := api.NewClientServerTxnsClient(leaderPeer.conn)
 		forwardCtx, cancel := context.WithTimeout(context.Background(), constants.FORWARD_TIMEOUT*time.Millisecond)
 		defer cancel()
-		return client.Request(forwardCtx, in)
+		resp, err := client.Request(forwardCtx, in)
+		if resp != nil {
+			return finish(resp, err)
+		}
+		// ensure duplicates are released even on forward failure
+		return finish(&api.Reply{Result: false, ServerId: int32(s.id), Error: "NOT_LEADER"}, err)
 	}
 	senderShard := shardOfAccount(in.Sender)
 	receiverShard := shardOfAccount(in.Receiver)
 	serverCluster := constants.ClusterOf(s.id)
 	if senderShard != -1 && receiverShard != -1 && senderShard != receiverShard && senderShard == serverCluster {
 		s.lock.Unlock()
-		return s.handleCrossShardRequest(ctx, in, senderShard, receiverShard)
+		resp, err := s.handleCrossShardRequest(ctx, in, senderShard, receiverShard)
+		if resp != nil {
+			return finish(resp, err)
+		}
+		return resp, err
 	}
 	s.seqNum++
 	currSeqNum := s.seqNum
@@ -580,22 +636,22 @@ func (s *ServerImpl) Request(ctx context.Context, in *api.Message) (*api.Reply, 
 		isLeader := s.state == constants.Leader
 		if !isLeader {
 			s.lock.Unlock()
-			return &api.Reply{Result: false, ServerId: int32(s.id), Error: "NOT_LEADER"}, nil
+			return finish(&api.Reply{Result: false, ServerId: int32(s.id), Error: "NOT_LEADER"}, nil)
 		}
 		if !s.isServerRunning() {
 			s.lock.Unlock()
-			return &api.Reply{Result: false, ServerId: int32(s.id), Error: "SERVER_DOWN"}, s.downErr()
+			return finish(&api.Reply{Result: false, ServerId: int32(s.id), Error: "SERVER_DOWN"}, s.downErr())
 		}
 		if s.ballot.BallotVal < s.leaderBallot.BallotVal || (s.ballot.BallotVal == s.leaderBallot.BallotVal && s.id < s.leaderBallot.ServerID) {
 			s.state = constants.Follower
 			s.lock.Unlock()
-			return &api.Reply{Result: false, ServerId: int32(s.id), Error: "NOT_LEADER"}, s.downErr()
+			return finish(&api.Reply{Result: false, ServerId: int32(s.id), Error: "NOT_LEADER"}, s.downErr())
 		}
 		s.lock.Unlock()
 		ok = s.peerManager.broadcastAccept(quorum, record, in.GetTimestamp())
 		attempts++
 		if !ok && attempts >= 3 {
-			return &api.Reply{Result: false, ServerId: int32(s.id), Error: "INSUFFICIENT_QUORUM"}, nil
+			return finish(&api.Reply{Result: false, ServerId: int32(s.id), Error: "INSUFFICIENT_QUORUM"}, nil)
 		}
 	}
 
@@ -617,13 +673,7 @@ func (s *ServerImpl) Request(ctx context.Context, in *api.Message) (*api.Reply, 
 	}
 	s.lock.Unlock()
 
-	s.clientManager.lock.Lock()
-	defer s.clientManager.lock.Unlock()
-	client, ok = s.clientManager.clientList[in.ClientId]
-	if ok && client.lastRequestTimeStamp == in.GetTimestamp() {
-		client.lastResponse = reply
-	}
-	return reply, nil
+	return finish(reply, nil)
 
 }
 
@@ -922,7 +972,9 @@ func (sm *StateMachine) restoreBalances(txID string) {
 		return
 	}
 	for acc, bal := range entry {
-		sm.vault[acc] = bal
+		if curr, ok := sm.vault[acc]; !ok || bal > curr {
+			sm.vault[acc] = bal
+		}
 	}
 	delete(sm.wal, txID)
 	sm.lock.Unlock()

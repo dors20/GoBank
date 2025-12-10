@@ -6,6 +6,7 @@ import (
 	"encoding/csv"
 	"fmt"
 	"io"
+	"math/rand"
 	"os"
 	"paxos/api"
 	"paxos/constants"
@@ -381,12 +382,16 @@ func runSetWithManagerCLI(m *TestCaseManager, set InputSet, stats *perfStats) er
 					if reply.Error != "" {
 						// Treat business-logic rejections as final, everything else retryable.
 						if strings.Contains(reply.Error, "INSUFFICIENT_BALANCE") ||
-							strings.Contains(reply.Error, "LOCK_CONFLICT") ||
+							// strings.Contains(reply.Error, "LOCK_CONFLICT") ||
 							strings.Contains(reply.Error, "INSUFFICIENT_QUORUM") {
 							logs.Infof("Transfer txn in set %d from %d to %d amount=%d rejected by server-%d: %s", set.SetNumber, c.Sender, c.Receiver, c.Amount, sid, reply.Error)
 							return
 						}
 						logs.Infof("Transfer txn in set %d from %d to %d amount=%d via server-%d got retryable error=%s", set.SetNumber, c.Sender, c.Receiver, c.Amount, sid, reply.Error)
+						continue
+					}
+					if reply.Error != "" && strings.Contains(reply.Error, "LOCK_CONFLICT") {
+						time.Sleep(time.Duration(rand.Intn(50)) * time.Millisecond)
 						continue
 					}
 					if !reply.Result {
@@ -554,11 +559,11 @@ func printPerformance(stats *perfStats) {
 	if totalWindow <= 0 {
 		totalWindow = time.Nanosecond
 	}
-	avgLatencyMs := float64(stats.totalLatency.Microseconds()) / float64(stats.txnCount)
+	avgLatencyMs := float64(stats.totalLatency.Milliseconds()) / float64(stats.txnCount)
 	throughput := float64(stats.txnCount) / totalWindow.Seconds()
 	logs.Infof("Performance: txns=%d throughput=%.2f txns/s avg-latency=%.3f ms max-latency=%.3f ms",
-		stats.txnCount, throughput, avgLatencyMs, float64(stats.maxLatency.Microseconds()))
-	fmt.Printf("Performance: txns=%d throughput=%.2f txns/s avg-latency=%.3f ms max-latency=%.3f ms\n", stats.txnCount, throughput, avgLatencyMs, float64(stats.maxLatency.Microseconds()))
+		stats.txnCount, throughput, avgLatencyMs, float64(stats.maxLatency.Milliseconds()))
+	fmt.Printf("Performance: txns=%d throughput=%.2f txns/s avg-latency=%.3f ms max-latency=%.3f ms\n", stats.txnCount, throughput, avgLatencyMs, float64(stats.maxLatency.Milliseconds()))
 }
 
 func cliPrintReshard() {
@@ -835,9 +840,21 @@ func makeRequest(sender, receiver string, amount int) {
 		Timestamp: txnID,
 	}
 
+	lockRetry := 0
 	for i := 0; i < 20; i++ {
 		reply := sendWithRetryOnce(req)
 		if reply != nil && !strings.Contains(reply.Error, "NOT_LEADER") {
+			if reply.Error == "LOCK_CONFLICT" {
+				if lockRetry < 10 {
+					lockRetry++
+					backoff := 30 + rand.Intn(40) + 10*lockRetry
+					time.Sleep(time.Duration(backoff) * time.Millisecond)
+					continue
+				}
+			}
+			if reply.Error == "INSUFFICIENT_QUORUM" {
+				return
+			}
 			logs.Infof("Request %s- tnx-%d completed. Leader is %d. Result: %t", sender, txnID, reply.ServerId, reply.Result)
 			sm.lock.Lock()
 			sm.currLeader = int(reply.ServerId)
