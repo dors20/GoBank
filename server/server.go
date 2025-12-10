@@ -1,13 +1,14 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
 	"log"
-	"maps"
 	"net"
 	"os"
+	"path/filepath"
 	"paxos/api"
 	"paxos/constants"
 	"paxos/logger"
@@ -17,6 +18,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/dgraph-io/badger/v4"
 	"go.uber.org/zap"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
@@ -43,6 +45,8 @@ type LogRecord struct {
 	Txn         *ClientRequestTxn `json:"txn"`
 	IsCommitted bool              `json:"committed"`
 	IsExecuted  bool              `json:"exececuted"`
+	Phase       string            `json:"phase"`
+	TxID        string            `json:"txId"`
 }
 
 type LogStore struct {
@@ -58,6 +62,8 @@ type StateMachine struct {
 	lastExecutedCommitNum int
 	executionStatus       map[int]chan bool
 	execPool              chan struct{}
+	locks                 map[string]bool
+	wal                   map[string]map[string]int
 }
 
 type Client struct {
@@ -86,6 +92,7 @@ type PeerManager struct {
 type ServerImpl struct {
 	lock            sync.Mutex
 	id              int
+	db              *badger.DB
 	ballot          *BallotNumber
 	seqNum          int
 	leaderTimer     *time.Timer
@@ -137,6 +144,226 @@ var logStore *LogStore
 var sm *StateMachine
 var logs *zap.SugaredLogger
 
+func dbPathForServer(id int) string {
+	return filepath.Join("data", fmt.Sprintf("server_%d", id))
+}
+
+func shardOfAccount(account string) int {
+	if account == "" {
+		return -1
+	}
+	n, err := strconv.Atoi(account)
+	if err != nil {
+		return -1
+	}
+	if n >= 1 && n <= 3000 {
+		return 0
+	}
+	if n >= 3001 && n <= 6000 {
+		return 1
+	}
+	if n >= 6001 && n <= 9000 {
+		return 2
+	}
+	return -1
+}
+
+func openDB(id int) *badger.DB {
+	path := dbPathForServer(id)
+	err := os.MkdirAll(path, 0755)
+	if err != nil {
+		logs.Fatalf("Failed to create DB directory %s: %v", path, err)
+	}
+	opts := badger.DefaultOptions(path)
+	opts.Logger = nil
+	db, err := badger.Open(opts)
+	if err != nil {
+		logs.Fatalf("Failed to open DB at %s: %v", path, err)
+	}
+	return db
+}
+
+func loadStateFromDB() {
+	if server == nil || server.db == nil {
+		return
+	}
+
+	maxSeq := 0
+	lastExecuted := 0
+
+	err := server.db.View(func(txn *badger.Txn) error {
+		it := txn.NewIterator(badger.DefaultIteratorOptions)
+		defer it.Close()
+
+		prefixVault := []byte("vault:")
+		prefixLog := []byte("log:")
+		prefixWal := []byte("wal:")
+		metaLastExecuted := []byte("meta:lastExecuted")
+
+		for it.Rewind(); it.Valid(); it.Next() {
+			item := it.Item()
+			key := item.KeyCopy(nil)
+
+			switch {
+			case bytes.HasPrefix(key, prefixVault):
+				account := string(key[len(prefixVault):])
+				err := item.Value(func(v []byte) error {
+					val, err := strconv.Atoi(string(v))
+					if err != nil {
+						return err
+					}
+					sm.vault[account] = val
+					return nil
+				})
+				if err != nil {
+					return err
+				}
+			case bytes.HasPrefix(key, prefixLog):
+				err := item.Value(func(v []byte) error {
+					var rec LogRecord
+					if err := json.Unmarshal(v, &rec); err != nil {
+						return err
+					}
+					r := rec
+					logStore.records[r.SeqNum] = &r
+					if r.SeqNum > maxSeq {
+						maxSeq = r.SeqNum
+					}
+					if r.IsExecuted && r.SeqNum > lastExecuted {
+						lastExecuted = r.SeqNum
+					}
+					return nil
+				})
+				if err != nil {
+					return err
+				}
+			case bytes.HasPrefix(key, prefixWal):
+				txID := string(key[len(prefixWal):])
+				err := item.Value(func(v []byte) error {
+					var entry map[string]int
+					if err := json.Unmarshal(v, &entry); err != nil {
+						return err
+					}
+					if sm.wal == nil {
+						sm.wal = make(map[string]map[string]int)
+					}
+					sm.wal[txID] = entry
+					return nil
+				})
+				if err != nil {
+					return err
+				}
+			case bytes.Equal(key, metaLastExecuted):
+				err := item.Value(func(v []byte) error {
+					val, err := strconv.Atoi(string(v))
+					if err != nil {
+						return err
+					}
+					lastExecuted = val
+					return nil
+				})
+				if err != nil {
+					return err
+				}
+			}
+		}
+
+		return nil
+	})
+
+	if err != nil {
+		logs.Warnf("Failed to load state from DB: %v", err)
+	}
+
+	sm.lastExecutedCommitNum = lastExecuted
+	server.seqNum = maxSeq
+}
+
+func persistLogRecord(record *LogRecord) {
+	if server == nil || server.db == nil || record == nil {
+		return
+	}
+
+	data, err := json.Marshal(record)
+	if err != nil {
+		logs.Warnf("Failed to marshal log record for seq %d: %v", record.SeqNum, err)
+		return
+	}
+
+	key := []byte(fmt.Sprintf("log:%d", record.SeqNum))
+	err = server.db.Update(func(txn *badger.Txn) error {
+		return txn.Set(key, data)
+	})
+	if err != nil {
+		logs.Warnf("Failed to persist log record for seq %d: %v", record.SeqNum, err)
+	}
+}
+
+func persistVaultEntry(account string, balance int) {
+	if server == nil || server.db == nil {
+		return
+	}
+
+	key := []byte("vault:" + account)
+	value := []byte(strconv.Itoa(balance))
+
+	err := server.db.Update(func(txn *badger.Txn) error {
+		return txn.Set(key, value)
+	})
+	if err != nil {
+		logs.Warnf("Failed to persist vault entry for %s: %v", account, err)
+	}
+}
+
+func persistLastExecuted(idx int) {
+	if server == nil || server.db == nil {
+		return
+	}
+
+	key := []byte("meta:lastExecuted")
+	value := []byte(strconv.Itoa(idx))
+
+	err := server.db.Update(func(txn *badger.Txn) error {
+		return txn.Set(key, value)
+	})
+	if err != nil {
+		logs.Warnf("Failed to persist last executed index %d: %v", idx, err)
+	}
+}
+
+func persistWAL(txID string, entry map[string]int) {
+	if server == nil || server.db == nil || txID == "" || entry == nil {
+		return
+	}
+
+	data, err := json.Marshal(entry)
+	if err != nil {
+		logs.Warnf("Failed to marshal WAL for tx %s: %v", txID, err)
+		return
+	}
+
+	key := []byte("wal:" + txID)
+	err = server.db.Update(func(txn *badger.Txn) error {
+		return txn.Set(key, data)
+	})
+	if err != nil {
+		logs.Warnf("Failed to persist WAL for tx %s: %v", txID, err)
+	}
+}
+
+func deleteWAL(txID string) {
+	if server == nil || server.db == nil || txID == "" {
+		return
+	}
+	key := []byte("wal:" + txID)
+	err := server.db.Update(func(txn *badger.Txn) error {
+		return txn.Delete(key)
+	})
+	if err != nil {
+		logs.Warnf("Failed to delete WAL for tx %s: %v", txID, err)
+	}
+}
+
 func startServer(id int, t time.Duration) {
 
 	logs = logger.InitLogger(id, true)
@@ -158,6 +385,8 @@ func startServer(id int, t time.Duration) {
 		lastExecutedCommitNum: 0,
 		executionStatus:       make(map[int]chan bool),
 		execPool:              make(chan struct{}, 1),
+		locks:                 make(map[string]bool),
+		wal:                   make(map[string]map[string]int),
 	}
 
 	pm := &PeerManager{
@@ -165,8 +394,11 @@ func startServer(id int, t time.Duration) {
 	}
 	s := constants.Follower
 
+	db := openDB(id)
+
 	server = &ServerImpl{
 		id:              id,
+		db:              db,
 		ballot:          &BallotNumber{BallotVal: 1, ServerID: id},
 		seqNum:          0,
 		leaderTimer:     time.NewTimer(t),
@@ -181,19 +413,21 @@ func startServer(id int, t time.Duration) {
 		pendingPrepares: make(map[string]*api.PrepareReq),
 		isRunning:       true,
 	}
-	if id == 1 {
+	cluster := constants.ClusterOf(id)
+	clusterLeader := cluster*constants.MAX_NODES + 1
+	if id == clusterLeader {
 		server.state = constants.Leader
 		server.ballot.BallotVal = 1
-		server.ballot.ServerID = 1
+		server.ballot.ServerID = id
 		server.leaderBallot.BallotVal = 1
-		server.leaderBallot.ServerID = 1
+		server.leaderBallot.ServerID = id
 	} else {
 		server.leaderBallot.BallotVal = 1
-		server.leaderBallot.ServerID = 1
+		server.leaderBallot.ServerID = clusterLeader
 	}
 	server.port = constants.ServerPorts[id]
 	server.peerManager.initPeerConnections(server.id) // Note - not doing as a singleton on becoming first time leader for simplicity
-	logStore.unmarshal()
+	loadStateFromDB()
 	sm.startExec()
 	go server.monitorLeader()
 	go server.startHeartbeat()
@@ -315,9 +549,16 @@ func (s *ServerImpl) Request(ctx context.Context, in *api.Message) (*api.Reply, 
 		defer cancel()
 		return client.Request(forwardCtx, in)
 	}
-
+	senderShard := shardOfAccount(in.Sender)
+	receiverShard := shardOfAccount(in.Receiver)
+	serverCluster := constants.ClusterOf(s.id)
+	if senderShard != -1 && receiverShard != -1 && senderShard != receiverShard && senderShard == serverCluster {
+		s.lock.Unlock()
+		return s.handleCrossShardRequest(ctx, in, senderShard, receiverShard)
+	}
 	s.seqNum++
 	currSeqNum := s.seqNum
+	txID := fmt.Sprintf("%s:%s:%d:%d", in.Sender, in.Receiver, in.Amount, in.Timestamp)
 	record := &LogRecord{
 		SeqNum: currSeqNum,
 		Ballot: &BallotNumber{BallotVal: int(s.ballot.BallotVal), ServerID: s.id},
@@ -327,24 +568,19 @@ func (s *ServerImpl) Request(ctx context.Context, in *api.Message) (*api.Reply, 
 			Amount:   int(in.Amount),
 		},
 		IsCommitted: false,
+		Phase:       "N",
+		TxID:        txID,
 	}
-	// NOTE - need to unlock here otherwise we are doing sequential processing
 	s.lock.Unlock()
 
 	logStore.append(record)
 	execChannel := sm.registerSignal(currSeqNum)
-
-	// TODO Can make this a server.Qourun const - Good to have
 	quorum := int((constants.MAX_NODES / 2) + 1)
 
 	ok = false
-	// *REVIEW* Do we want an Infinite for LOOP
-	// TODO NEED to Handle on follower side, if its already accepted this message then it should still reply
-	// Need to check if this server is still leader and if not we need to insert no-op in that log index
 	for !ok {
 		s.lock.Lock()
 		isLeader := s.state == constants.Leader
-
 		if !isLeader {
 			s.lock.Unlock()
 			return &api.Reply{Result: false, ServerId: int32(s.id), Error: "NOT_LEADER"}, nil
@@ -360,7 +596,6 @@ func (s *ServerImpl) Request(ctx context.Context, in *api.Message) (*api.Reply, 
 		}
 		s.lock.Unlock()
 		ok = s.peerManager.broadcastAccept(quorum, record, in.GetTimestamp())
-
 	}
 
 	logStore.markCommitted(currSeqNum)
@@ -386,10 +621,174 @@ func (s *ServerImpl) Request(ctx context.Context, in *api.Message) (*api.Reply, 
 	client, ok = s.clientManager.clientList[in.ClientId]
 	if ok && client.lastRequestTimeStamp == in.GetTimestamp() {
 		client.lastResponse = reply
-		logs.Infof("Cached reply for client-%s with request timestamp: %d", in.ClientId, in.GetTimestamp())
 	}
 	return reply, nil
 
+}
+
+func (s *ServerImpl) handleCrossShardRequest(ctx context.Context, in *api.Message, senderShard int, receiverShard int) (*api.Reply, error) {
+	txID := fmt.Sprintf("%s:%s:%d:%d", in.Sender, in.Receiver, in.Amount, in.Timestamp)
+	if !sm.tryLockAccounts(in.Sender) {
+		return &api.Reply{Result: false, ServerId: int32(s.id), Error: "LOCK_CONFLICT"}, nil
+	}
+	sm.lock.Lock()
+	bal, ok := sm.vault[in.Sender]
+	if !ok {
+		bal = constants.INITIAL_BALANCE
+	}
+	if bal < int(in.Amount) {
+		sm.lock.Unlock()
+		sm.restoreBalances(txID)
+		sm.unlockAccounts(in.Sender)
+		return &api.Reply{Result: false, ServerId: int32(s.id), Error: "INSUFFICIENT_BALANCE"}, nil
+	}
+	sm.lock.Unlock()
+	sm.snapshotBalances(txID, in.Sender)
+
+	localPrepared, _ := s.proposeLogWithPhase("P", txID, in.Sender, in.Receiver, int(in.Amount), in.GetTimestamp())
+	if !localPrepared {
+		sm.restoreBalances(txID)
+		sm.unlockAccounts(in.Sender)
+		return &api.Reply{Result: false, ServerId: int32(s.id), Error: "PREPARE_FAILED"}, nil
+	}
+
+	targetCluster := receiverShard
+	targetLeader := targetCluster*constants.MAX_NODES + 1
+	port, ok := constants.ServerPorts[targetLeader]
+	if !ok {
+		sm.restoreBalances(txID)
+		sm.unlockAccounts(in.Sender)
+		return &api.Reply{Result: false, ServerId: int32(s.id), Error: "UNKNOWN_PARTICIPANT"}, nil
+	}
+
+	address := fmt.Sprintf("localhost:%s", port)
+	conn, err := grpc.NewClient(address, grpc.WithTransportCredentials(insecure.NewCredentials()))
+	if err != nil {
+		sm.restoreBalances(txID)
+		sm.unlockAccounts(in.Sender)
+		return &api.Reply{Result: false, ServerId: int32(s.id), Error: "PARTICIPANT_UNREACHABLE"}, nil
+	}
+	defer conn.Close()
+
+	client := api.NewClientServerTxnsClient(conn)
+	pctx, pcancel := context.WithTimeout(ctx, constants.REQUEST_TIMEOUT*time.Millisecond)
+	defer pcancel()
+	prepReq := &api.Prepare2PCRequest{
+		Sender:    in.Sender,
+		Receiver:  in.Receiver,
+		Amount:    in.Amount,
+		TxId:      txID,
+		Timestamp: in.GetTimestamp(),
+	}
+	prepResp, err := client.Prepare2PC(pctx, prepReq)
+	if err != nil || prepResp == nil || !prepResp.Prepared {
+		s.proposeLogWithPhase("A", txID, in.Sender, in.Receiver, int(in.Amount), in.GetTimestamp())
+		sm.restoreBalances(txID)
+		sm.unlockAccounts(in.Sender)
+		dctx, dcancel := context.WithTimeout(context.Background(), constants.REQUEST_TIMEOUT*time.Millisecond)
+		defer dcancel()
+		decideReq := &api.Decide2PCRequest{
+			TxId:      txID,
+			Sender:    in.Sender,
+			Receiver:  in.Receiver,
+			Amount:    in.Amount,
+			Commit:    false,
+			Timestamp: in.GetTimestamp(),
+		}
+		client.Decide2PC(dctx, decideReq)
+		return &api.Reply{Result: false, ServerId: int32(s.id), Error: "ABORTED"}, nil
+	}
+
+	localCommit, res := s.proposeLogWithPhase("C", txID, in.Sender, in.Receiver, int(in.Amount), in.GetTimestamp())
+	if !localCommit {
+		s.proposeLogWithPhase("A", txID, in.Sender, in.Receiver, int(in.Amount), in.GetTimestamp())
+		sm.restoreBalances(txID)
+		sm.unlockAccounts(in.Sender)
+		dctx, dcancel := context.WithTimeout(context.Background(), constants.REQUEST_TIMEOUT*time.Millisecond)
+		defer dcancel()
+		decideReq := &api.Decide2PCRequest{
+			TxId:      txID,
+			Sender:    in.Sender,
+			Receiver:  in.Receiver,
+			Amount:    in.Amount,
+			Commit:    false,
+			Timestamp: in.GetTimestamp(),
+		}
+		client.Decide2PC(dctx, decideReq)
+		return &api.Reply{Result: false, ServerId: int32(s.id), Error: "COMMIT_FAILED"}, nil
+	}
+
+	dctx, dcancel := context.WithTimeout(context.Background(), constants.REQUEST_TIMEOUT*time.Millisecond)
+	defer dcancel()
+	decideReq := &api.Decide2PCRequest{
+		TxId:      txID,
+		Sender:    in.Sender,
+		Receiver:  in.Receiver,
+		Amount:    in.Amount,
+		Commit:    true,
+		Timestamp: in.GetTimestamp(),
+	}
+	client.Decide2PC(dctx, decideReq)
+
+	reply := &api.Reply{
+		BallotVal: int32(s.ballot.BallotVal),
+		ServerId:  int32(s.id),
+		Timestamp: in.GetTimestamp(),
+		ClientId:  in.GetClientId(),
+		Result:    res,
+	}
+	return reply, nil
+}
+
+func (s *ServerImpl) proposeLogWithPhase(phase string, txID string, sender string, receiver string, amount int, timestamp int64) (bool, bool) {
+	s.lock.Lock()
+	if !s.isServerRunning() || s.state != constants.Leader {
+		s.lock.Unlock()
+		return false, false
+	}
+	s.seqNum++
+	currSeqNum := s.seqNum
+	record := &LogRecord{
+		SeqNum: currSeqNum,
+		Ballot: &BallotNumber{BallotVal: int(s.ballot.BallotVal), ServerID: s.id},
+		Txn: &ClientRequestTxn{
+			Sender:   sender,
+			Reciever: receiver,
+			Amount:   amount,
+		},
+		IsCommitted: false,
+		Phase:       phase,
+		TxID:        txID,
+	}
+	s.lock.Unlock()
+
+	logStore.append(record)
+	quorum := int((constants.MAX_NODES / 2) + 1)
+
+	ok := false
+	for !ok {
+		s.lock.Lock()
+		isLeader := s.state == constants.Leader
+		if !isLeader {
+			s.lock.Unlock()
+			return false, false
+		}
+		if !s.isServerRunning() {
+			s.lock.Unlock()
+			return false, false
+		}
+		if s.ballot.BallotVal < s.leaderBallot.BallotVal || (s.ballot.BallotVal == s.leaderBallot.BallotVal && s.id < s.leaderBallot.ServerID) {
+			s.state = constants.Follower
+			s.lock.Unlock()
+			return false, false
+		}
+		s.lock.Unlock()
+		ok = s.peerManager.broadcastAccept(quorum, record, timestamp)
+	}
+
+	logStore.markCommitted(currSeqNum)
+	sm.applyTxn()
+	return true, true
 }
 
 func (sm *StateMachine) startExec() {
@@ -401,6 +800,115 @@ func (sm *StateMachine) startExec() {
 			sm.execCommitLogs()
 		}
 	}()
+}
+
+func (sm *StateMachine) tryLockAccounts(accounts ...string) bool {
+	sm.lock.Lock()
+	defer sm.lock.Unlock()
+
+	if len(accounts) == 0 {
+		return true
+	}
+
+	seen := make(map[string]struct{})
+	for _, acc := range accounts {
+		if acc == "" {
+			continue
+		}
+		if _, ok := seen[acc]; ok {
+			continue
+		}
+		seen[acc] = struct{}{}
+		if sm.locks[acc] {
+			return false
+		}
+	}
+	for acc := range seen {
+		sm.locks[acc] = true
+	}
+	return true
+}
+
+func (sm *StateMachine) unlockAccounts(accounts ...string) {
+	sm.lock.Lock()
+	defer sm.lock.Unlock()
+
+	if len(accounts) == 0 {
+		return
+	}
+
+	seen := make(map[string]struct{})
+	for _, acc := range accounts {
+		if acc == "" {
+			continue
+		}
+		if _, ok := seen[acc]; ok {
+			continue
+		}
+		seen[acc] = struct{}{}
+	}
+	for acc := range seen {
+		delete(sm.locks, acc)
+	}
+}
+
+func (sm *StateMachine) snapshotBalances(txID string, accounts ...string) {
+	if txID == "" || len(accounts) == 0 {
+		return
+	}
+	sm.lock.Lock()
+	entry, ok := sm.wal[txID]
+	if !ok {
+		entry = make(map[string]int)
+		sm.wal[txID] = entry
+	}
+	for _, acc := range accounts {
+		if acc == "" {
+			continue
+		}
+		if _, exists := entry[acc]; exists {
+			continue
+		}
+		bal, ok := sm.vault[acc]
+		if !ok {
+			bal = constants.INITIAL_BALANCE
+		}
+		entry[acc] = bal
+	}
+	localCopy := make(map[string]int, len(entry))
+	for k, v := range entry {
+		localCopy[k] = v
+	}
+	sm.lock.Unlock()
+	persistWAL(txID, localCopy)
+}
+
+func (sm *StateMachine) restoreBalances(txID string) {
+	if txID == "" {
+		return
+	}
+	sm.lock.Lock()
+	entry, ok := sm.wal[txID]
+	if !ok {
+		sm.lock.Unlock()
+		return
+	}
+	for acc, bal := range entry {
+		sm.vault[acc] = bal
+	}
+	delete(sm.wal, txID)
+	sm.lock.Unlock()
+	deleteWAL(txID)
+}
+
+func (sm *StateMachine) clearWAL(txID string) {
+	if txID == "" {
+		return
+	}
+	sm.lock.Lock()
+	delete(sm.wal, txID)
+	sm.lock.Unlock()
+	deleteWAL(txID)
 }
 
 func (sm *StateMachine) execCommitLogs() {
@@ -429,20 +937,66 @@ func (sm *StateMachine) execCommitLogs() {
 		}
 		if _, ok := sm.vault[reciever]; !ok {
 			sm.vault[reciever] = constants.INITIAL_BALANCE
-			logs.Infof("Detected new user, Initializing Balance for User: %s with %d", reciever, constants.INITIAL_BALANCE)
 		}
 
 		var res bool
-		if sm.vault[sender] >= logToApply.Txn.Amount {
-			sm.vault[sender] -= logToApply.Txn.Amount
-			sm.vault[reciever] += logToApply.Txn.Amount
+		walToDelete := ""
+		phase := logToApply.Phase
+		if phase == "" || phase == "N" {
+			if sm.vault[sender] >= logToApply.Txn.Amount {
+				sm.vault[sender] -= logToApply.Txn.Amount
+				sm.vault[reciever] += logToApply.Txn.Amount
+				res = true
+			}
+		} else if phase == "P" {
 			res = true
-			logs.Infof("Successfully applied txn with commitIdx %d and segNum %d", nextCommitIdx, logToApply.SeqNum)
-		} else {
-			logs.Warnf("Insufficient Balance for txn with commitIdx %d and segNum %d", nextCommitIdx, logToApply.SeqNum)
+		} else if phase == "C" {
+			cluster := constants.ClusterOf(server.id)
+			senderShard := shardOfAccount(sender)
+			receiverShard := shardOfAccount(reciever)
+			if senderShard != -1 && cluster == senderShard {
+				if sm.vault[sender] >= logToApply.Txn.Amount {
+					sm.vault[sender] -= logToApply.Txn.Amount
+					res = true
+				}
+				delete(sm.locks, sender)
+			}
+			if receiverShard != -1 && cluster == receiverShard {
+				sm.vault[reciever] += logToApply.Txn.Amount
+				res = true
+				delete(sm.locks, reciever)
+			}
+			if logToApply.TxID != "" {
+				if _, ok := sm.wal[logToApply.TxID]; ok {
+					delete(sm.wal, logToApply.TxID)
+					walToDelete = logToApply.TxID
+				}
+			}
+		} else if phase == "A" {
+			if logToApply.TxID != "" {
+				if entry, ok := sm.wal[logToApply.TxID]; ok {
+					for acc, bal := range entry {
+						sm.vault[acc] = bal
+					}
+					delete(sm.wal, logToApply.TxID)
+					walToDelete = logToApply.TxID
+				}
+			}
+			cluster := constants.ClusterOf(server.id)
+			senderShard := shardOfAccount(sender)
+			receiverShard := shardOfAccount(reciever)
+			if senderShard != -1 && cluster == senderShard {
+				delete(sm.locks, sender)
+			}
+			if receiverShard != -1 && cluster == receiverShard {
+				delete(sm.locks, reciever)
+			}
 		}
 		sm.lastExecutedCommitNum++
 		logToApply.IsExecuted = true
+		executedIdx := sm.lastExecutedCommitNum
+		senderBalance := sm.vault[sender]
+		recieverBalance := sm.vault[reciever]
 		execChan, ok := sm.executionStatus[logToApply.SeqNum]
 		if ok {
 			execChan <- res
@@ -451,6 +1005,14 @@ func (sm *StateMachine) execCommitLogs() {
 		}
 		sm.lock.Unlock()
 		logStore.lock.Unlock()
+
+		persistVaultEntry(sender, senderBalance)
+		persistVaultEntry(reciever, recieverBalance)
+		persistLastExecuted(executedIdx)
+		persistLogRecord(logToApply)
+		if walToDelete != "" {
+			deleteWAL(walToDelete)
+		}
 	}
 }
 
@@ -493,7 +1055,9 @@ func (ls *LogStore) markCommitted(seqNum int) {
 	}
 	ls.lock.Unlock()
 
-	go ls.marshal()
+	if ok {
+		persistLogRecord(record)
+	}
 }
 
 func (sm *StateMachine) applyTxn() {
@@ -506,6 +1070,108 @@ func (sm *StateMachine) applyTxn() {
 	default:
 	}
 
+}
+
+func (s *ServerImpl) GetBalance(ctx context.Context, in *api.BalanceRequest) (*api.BalanceReply, error) {
+	logs.Debug("Enter")
+	defer logs.Debug("Exit")
+
+	if !s.isServerRunning() {
+		return &api.BalanceReply{}, s.downErr()
+	}
+
+	account := in.GetAccount()
+	sm.lock.Lock()
+	bal, ok := sm.vault[account]
+	if !ok {
+		bal = constants.INITIAL_BALANCE
+	}
+	sm.lock.Unlock()
+
+	return &api.BalanceReply{
+		Balance: int32(bal),
+		Found:   ok,
+	}, nil
+}
+
+func (s *ServerImpl) Prepare2PC(ctx context.Context, in *api.Prepare2PCRequest) (*api.Prepare2PCReply, error) {
+	logs.Debug("Enter")
+	defer logs.Debug("Exit")
+
+	if !s.isServerRunning() {
+		return &api.Prepare2PCReply{Prepared: false, Error: "SERVER_DOWN"}, s.downErr()
+	}
+
+	s.lock.Lock()
+	if s.state != constants.Leader {
+		leaderID := s.leaderBallot.ServerID
+		s.lock.Unlock()
+		if leaderID == 0 || leaderID == s.id {
+			return &api.Prepare2PCReply{Prepared: false, Error: "NOT_LEADER"}, nil
+		}
+		s.peerManager.lock.Lock()
+		leaderPeer, ok := s.peerManager.peers[leaderID]
+		s.peerManager.lock.Unlock()
+		if !ok {
+			return &api.Prepare2PCReply{Prepared: false, Error: "NOT_LEADER"}, nil
+		}
+		client := api.NewClientServerTxnsClient(leaderPeer.conn)
+		forwardCtx, cancel := context.WithTimeout(context.Background(), constants.FORWARD_TIMEOUT*time.Millisecond)
+		defer cancel()
+		return client.Prepare2PC(forwardCtx, in)
+	}
+	s.lock.Unlock()
+
+	if !sm.tryLockAccounts(in.Receiver) {
+		return &api.Prepare2PCReply{Prepared: false, Error: "LOCK_CONFLICT"}, nil
+	}
+	sm.snapshotBalances(in.TxId, in.Receiver)
+
+	ok, _ := s.proposeLogWithPhase("P", in.TxId, in.Sender, in.Receiver, int(in.Amount), in.GetTimestamp())
+	if !ok {
+		sm.restoreBalances(in.TxId)
+		sm.unlockAccounts(in.Receiver)
+		return &api.Prepare2PCReply{Prepared: false, Error: "PREPARE_FAILED"}, nil
+	}
+
+	return &api.Prepare2PCReply{Prepared: true}, nil
+}
+
+func (s *ServerImpl) Decide2PC(ctx context.Context, in *api.Decide2PCRequest) (*api.Blank, error) {
+	logs.Debug("Enter")
+	defer logs.Debug("Exit")
+
+	if !s.isServerRunning() {
+		return &api.Blank{}, s.downErr()
+	}
+
+	s.lock.Lock()
+	if s.state != constants.Leader {
+		leaderID := s.leaderBallot.ServerID
+		s.lock.Unlock()
+		if leaderID == 0 || leaderID == s.id {
+			return &api.Blank{}, nil
+		}
+		s.peerManager.lock.Lock()
+		leaderPeer, ok := s.peerManager.peers[leaderID]
+		s.peerManager.lock.Unlock()
+		if !ok {
+			return &api.Blank{}, nil
+		}
+		client := api.NewClientServerTxnsClient(leaderPeer.conn)
+		forwardCtx, cancel := context.WithTimeout(context.Background(), constants.FORWARD_TIMEOUT*time.Millisecond)
+		defer cancel()
+		return client.Decide2PC(forwardCtx, in)
+	}
+	s.lock.Unlock()
+
+	if in.Commit {
+		s.proposeLogWithPhase("C", in.TxId, in.Sender, in.Receiver, int(in.Amount), in.GetTimestamp())
+	} else {
+		s.proposeLogWithPhase("A", in.TxId, in.Sender, in.Receiver, int(in.Amount), in.GetTimestamp())
+	}
+
+	return &api.Blank{}, nil
 }
 
 func (s *ServerImpl) PrintLog(ctx context.Context, in *api.Blank) (*api.Logs, error) {
@@ -533,6 +1199,8 @@ func (s *ServerImpl) PrintLog(ctx context.Context, in *api.Blank) (*api.Logs, er
 			Receiver:    record.Txn.Reciever,
 			Amount:      int32(record.Txn.Amount),
 			IsCommitted: record.IsCommitted,
+			Phase:       record.Phase,
+			TxId:        record.TxID,
 		}
 		entries = append(entries, entry)
 	}
@@ -594,17 +1262,20 @@ func (pm *PeerManager) initPeerConnections(currServer int) {
 	pm.lock.Lock()
 	defer pm.lock.Unlock()
 
-	for serverId := 1; serverId <= constants.MAX_NODES; serverId++ {
+	for serverId, port := range constants.ServerPorts {
 		if serverId == currServer {
 			continue
 		}
+		if constants.ClusterOf(serverId) != constants.ClusterOf(currServer) {
+			continue
+		}
 
-		addr := fmt.Sprintf("localhost:%s", constants.ServerPorts[serverId])
+		addr := fmt.Sprintf("localhost:%s", port)
 		conn, err := grpc.NewClient(addr, grpc.WithTransportCredentials(insecure.NewCredentials()))
 		if err != nil {
-			logs.Warnf("failed to create connection to server %d: %v", serverId, err) // *NOTE* Not using Fatal , we can treat this as a non byzantine problem
+			logs.Warnf("failed to create connection to server %d: %v", serverId, err)
+			continue
 		}
-		// TODO also api.Leader Election clients
 		client := api.NewPaxosReplicationClient(conn)
 		pm.peers[serverId] = &Peer{
 			id:   serverId,
@@ -629,6 +1300,8 @@ func (pm *PeerManager) broadcastAccept(quoram int, record *LogRecord, timestamp 
 		Receiver:  record.Txn.Reciever,
 		Amount:    int32(record.Txn.Amount),
 		Timestamp: timestamp,
+		Phase:     record.Phase,
+		TxId:      record.TxID,
 	}
 
 	for _, peer := range pm.peers {
@@ -676,6 +1349,8 @@ func (pm *PeerManager) broadcastCommit(record *LogRecord) {
 		Sender:    record.Txn.Sender,
 		Receiver:  record.Txn.Reciever,
 		Amount:    int32(record.Txn.Amount),
+		Phase:     record.Phase,
+		TxId:      record.TxID,
 	}
 
 	for _, peer := range pm.peers {
@@ -748,6 +1423,8 @@ func (s *ServerImpl) Accept(ctx context.Context, in *api.LogRecord) (*api.Accept
 			Amount:   int(in.Amount),
 		},
 		IsCommitted: false,
+		Phase:       in.GetPhase(),
+		TxID:        in.GetTxId(),
 	}
 	// **Check** Do I need to add to log or just add  the commited log??????
 	logStore.append(record)
@@ -812,12 +1489,15 @@ func (s *ServerImpl) Commit(ctx context.Context, in *api.LogRecord) (*api.Blank,
 				Reciever: in.Receiver,
 				Amount:   int(in.Amount),
 			},
+			Phase: in.GetPhase(),
+			TxID:  in.GetTxId(),
 		}
 		logStore.records[seqNum] = record
 	}
 	record.IsCommitted = true
 	logStore.lock.Unlock()
 
+	persistLogRecord(record)
 	sm.applyTxn()
 
 	return &api.Blank{}, nil
@@ -933,6 +1613,8 @@ func (s *ServerImpl) startElection() {
 			Receiver:    record.Txn.Reciever,
 			Amount:      int32(record.Txn.Amount),
 			IsCommitted: record.IsCommitted,
+			Phase:       record.Phase,
+			TxId:        record.TxID,
 		})
 	}
 	logStore.lock.Unlock()
@@ -1113,6 +1795,8 @@ func (s *ServerImpl) becomeLeader(ballotVal int, promiseLogs []*api.LogRecord) {
 				Amount:      rec.Amount,
 				Timestamp:   rec.Timestamp,
 				IsCommitted: false,
+				Phase:       rec.Phase,
+				TxId:        rec.TxId,
 			}
 			finalLog = append(finalLog, newRec)
 		} else {
@@ -1228,7 +1912,6 @@ func (s *ServerImpl) NewView(ctx context.Context, in *api.NewViewReq) (*api.Blan
 		}
 		logStore.records[int(newRecord.GetSeqNum())] = &LogRecord{
 			SeqNum: int(newRecord.GetSeqNum()),
-
 			Ballot: &BallotNumber{BallotVal: int(newRecord.GetBallotVal()), ServerID: int(newRecord.GetServerId())},
 			Txn: &ClientRequestTxn{
 				Sender:   newRecord.GetSender(),
@@ -1237,6 +1920,8 @@ func (s *ServerImpl) NewView(ctx context.Context, in *api.NewViewReq) (*api.Blan
 			},
 			IsCommitted: false,
 			IsExecuted:  false,
+			Phase:       newRecord.GetPhase(),
+			TxID:        newRecord.GetTxId(),
 		}
 	}
 	go logStore.marshal()
@@ -1353,72 +2038,9 @@ func (s *ServerImpl) logCatchupLoop() {
 }
 
 func (ls *LogStore) marshal() {
-	return
-	logs.Debug("Enter")
-	defer logs.Debug("Exit")
-	ls.lock.Lock()
-	recordsCopy := make(map[int]*LogRecord, len(ls.records))
-	maps.Copy(recordsCopy, ls.records)
-	ls.lock.Unlock()
-
-	data, err := json.MarshalIndent(recordsCopy, "", "  ")
-	if err != nil {
-		logs.Warnf("Failed to marshal log store: %v", err)
-		return
-	}
-
-	filePath := ls.logsPath
-	err = os.WriteFile(filePath, data, 0644)
-	if err != nil {
-		logs.Warnf("Failed to write log store to file %s: %v", filePath, err)
-	}
 }
 
 func (ls *LogStore) unmarshal() {
-	return
-	logs.Debug("enter")
-	defer logs.Debug("Exit")
-
-	filePath := ls.logsPath
-	if _, err := os.Stat(filePath); os.IsNotExist(err) {
-		logs.Infof("Log file %s not found, starting with an empty log store.", filePath)
-		return
-	}
-
-	data, err := os.ReadFile(filePath)
-	if err != nil {
-		logs.Warnf("Failed to read log file %s: %v", filePath, err)
-		return
-	}
-
-	if len(data) == 0 {
-		logs.Infof("Log file %s is empty, starting with an empty log store.", filePath)
-		return
-	}
-
-	ls.lock.Lock()
-	defer ls.lock.Unlock()
-
-	var records map[int]*LogRecord
-	err = json.Unmarshal(data, &records)
-	if err != nil {
-		logs.Warnf("Failed to unmarshal log data from %s: %v", filePath, err)
-		return
-	}
-
-	maxSeq := 0
-	for seq, record := range records {
-		record.IsCommitted = false
-		record.IsExecuted = false
-		if seq > maxSeq {
-			maxSeq = seq
-		}
-	}
-	ls.records = records
-	if server != nil {
-		server.seqNum = maxSeq
-	}
-	logs.Infof("Successfully loaded %d records from log file %s. Max seqNum set to %d.", len(ls.records), filePath, maxSeq)
 }
 
 func (s *ServerImpl) startLogCatchup() {
@@ -1473,12 +2095,8 @@ func (s *ServerImpl) startLogCatchup() {
 				return
 			}
 			var pulled *api.LogRecord
-			for id := 1; id <= constants.MAX_NODES; id++ {
-				if id == s.id {
-					continue
-				}
-				p, ok := s.peerManager.peers[id]
-				if !ok || p.conn == nil {
+			for id, p := range s.peerManager.peers {
+				if id == s.id || p.conn == nil {
 					continue
 				}
 				client := api.NewPaxosPrintInfoClient(p.conn)
@@ -1503,6 +2121,7 @@ func (s *ServerImpl) startLogCatchup() {
 			}
 
 			logStore.lock.Lock()
+			var recToPersist *LogRecord
 			rec, ok := logStore.records[target]
 			if ok {
 				if rec.IsCommitted || rec.IsExecuted {
@@ -1516,8 +2135,9 @@ func (s *ServerImpl) startLogCatchup() {
 					Amount:   int(pulled.Amount),
 				}
 				rec.IsCommitted = true
+				recToPersist = rec
 			} else {
-				logStore.records[target] = &LogRecord{
+				newRec := &LogRecord{
 					SeqNum: target,
 					Ballot: &BallotNumber{BallotVal: int(pulled.BallotVal), ServerID: int(pulled.ServerId)},
 					Txn: &ClientRequestTxn{
@@ -1526,10 +2146,16 @@ func (s *ServerImpl) startLogCatchup() {
 						Amount:   int(pulled.Amount),
 					},
 					IsCommitted: true,
+					Phase:       pulled.GetPhase(),
+					TxID:        pulled.GetTxId(),
 				}
+				logStore.records[target] = newRec
+				recToPersist = newRec
 			}
 			logStore.lock.Unlock()
-			go logStore.marshal()
+			if recToPersist != nil {
+				persistLogRecord(recToPersist)
+			}
 		}
 
 		sm.applyTxn()

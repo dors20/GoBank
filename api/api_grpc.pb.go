@@ -26,6 +26,9 @@ type ClientServerTxnsClient interface {
 	SimulateNodeFailure(ctx context.Context, in *Blank, opts ...grpc.CallOption) (*Blank, error)
 	SimulateLeaderFailure(ctx context.Context, in *Blank, opts ...grpc.CallOption) (*Blank, error)
 	RecoverNode(ctx context.Context, in *Blank, opts ...grpc.CallOption) (*Blank, error)
+	GetBalance(ctx context.Context, in *BalanceRequest, opts ...grpc.CallOption) (*BalanceReply, error)
+	Prepare2PC(ctx context.Context, in *Prepare2PCRequest, opts ...grpc.CallOption) (*Prepare2PCReply, error)
+	Decide2PC(ctx context.Context, in *Decide2PCRequest, opts ...grpc.CallOption) (*Blank, error)
 }
 
 type clientServerTxnsClient struct {
@@ -72,6 +75,33 @@ func (c *clientServerTxnsClient) RecoverNode(ctx context.Context, in *Blank, opt
 	return out, nil
 }
 
+func (c *clientServerTxnsClient) GetBalance(ctx context.Context, in *BalanceRequest, opts ...grpc.CallOption) (*BalanceReply, error) {
+	out := new(BalanceReply)
+	err := c.cc.Invoke(ctx, "/api.ClientServerTxns/GetBalance", in, out, opts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *clientServerTxnsClient) Prepare2PC(ctx context.Context, in *Prepare2PCRequest, opts ...grpc.CallOption) (*Prepare2PCReply, error) {
+	out := new(Prepare2PCReply)
+	err := c.cc.Invoke(ctx, "/api.ClientServerTxns/Prepare2PC", in, out, opts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *clientServerTxnsClient) Decide2PC(ctx context.Context, in *Decide2PCRequest, opts ...grpc.CallOption) (*Blank, error) {
+	out := new(Blank)
+	err := c.cc.Invoke(ctx, "/api.ClientServerTxns/Decide2PC", in, out, opts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 // ClientServerTxnsServer is the server API for ClientServerTxns service.
 // All implementations must embed UnimplementedClientServerTxnsServer
 // for forward compatibility
@@ -80,6 +110,9 @@ type ClientServerTxnsServer interface {
 	SimulateNodeFailure(context.Context, *Blank) (*Blank, error)
 	SimulateLeaderFailure(context.Context, *Blank) (*Blank, error)
 	RecoverNode(context.Context, *Blank) (*Blank, error)
+	GetBalance(context.Context, *BalanceRequest) (*BalanceReply, error)
+	Prepare2PC(context.Context, *Prepare2PCRequest) (*Prepare2PCReply, error)
+	Decide2PC(context.Context, *Decide2PCRequest) (*Blank, error)
 	mustEmbedUnimplementedClientServerTxnsServer()
 }
 
@@ -98,6 +131,15 @@ func (UnimplementedClientServerTxnsServer) SimulateLeaderFailure(context.Context
 }
 func (UnimplementedClientServerTxnsServer) RecoverNode(context.Context, *Blank) (*Blank, error) {
 	return nil, status.Errorf(codes.Unimplemented, "method RecoverNode not implemented")
+}
+func (UnimplementedClientServerTxnsServer) GetBalance(context.Context, *BalanceRequest) (*BalanceReply, error) {
+	return nil, status.Errorf(codes.Unimplemented, "method GetBalance not implemented")
+}
+func (UnimplementedClientServerTxnsServer) Prepare2PC(context.Context, *Prepare2PCRequest) (*Prepare2PCReply, error) {
+	return nil, status.Errorf(codes.Unimplemented, "method Prepare2PC not implemented")
+}
+func (UnimplementedClientServerTxnsServer) Decide2PC(context.Context, *Decide2PCRequest) (*Blank, error) {
+	return nil, status.Errorf(codes.Unimplemented, "method Decide2PC not implemented")
 }
 func (UnimplementedClientServerTxnsServer) mustEmbedUnimplementedClientServerTxnsServer() {}
 
@@ -184,6 +226,60 @@ func _ClientServerTxns_RecoverNode_Handler(srv interface{}, ctx context.Context,
 	return interceptor(ctx, in, info, handler)
 }
 
+func _ClientServerTxns_GetBalance_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(BalanceRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(ClientServerTxnsServer).GetBalance(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: "/api.ClientServerTxns/GetBalance",
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(ClientServerTxnsServer).GetBalance(ctx, req.(*BalanceRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _ClientServerTxns_Prepare2PC_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(Prepare2PCRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(ClientServerTxnsServer).Prepare2PC(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: "/api.ClientServerTxns/Prepare2PC",
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(ClientServerTxnsServer).Prepare2PC(ctx, req.(*Prepare2PCRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _ClientServerTxns_Decide2PC_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(Decide2PCRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(ClientServerTxnsServer).Decide2PC(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: "/api.ClientServerTxns/Decide2PC",
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(ClientServerTxnsServer).Decide2PC(ctx, req.(*Decide2PCRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
 // ClientServerTxns_ServiceDesc is the grpc.ServiceDesc for ClientServerTxns service.
 // It's only intended for direct use with grpc.RegisterService,
 // and not to be introspected or modified (even as a copy)
@@ -206,6 +302,18 @@ var ClientServerTxns_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "RecoverNode",
 			Handler:    _ClientServerTxns_RecoverNode_Handler,
+		},
+		{
+			MethodName: "GetBalance",
+			Handler:    _ClientServerTxns_GetBalance_Handler,
+		},
+		{
+			MethodName: "Prepare2PC",
+			Handler:    _ClientServerTxns_Prepare2PC_Handler,
+		},
+		{
+			MethodName: "Decide2PC",
+			Handler:    _ClientServerTxns_Decide2PC_Handler,
 		},
 	},
 	Streams:  []grpc.StreamDesc{},

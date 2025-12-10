@@ -15,11 +15,12 @@ const (
 // SYSTEM CONFIG
 const MAX_CLIENTS = 10
 const MAX_NODES = 3
+const NUM_CLUSTERS = 3
 
 // NETWORK CONFIG
 const LEADER_TIMEOUT_SECONDS = 200
-const REQUEST_TIMEOUT = 100
-const FORWARD_TIMEOUT = 50
+const REQUEST_TIMEOUT = 500
+const FORWARD_TIMEOUT = 250
 const BASE_PORT = "9100"
 const PREPARE_TIMEOUT = 100
 const HEARTBEAT = 50
@@ -40,4 +41,15 @@ var ServerPorts = map[int]string{
 	3: "9113",
 	4: "9114",
 	5: "9115",
+	6: "9116",
+	7: "9117",
+	8: "9118",
+	9: "9119",
+}
+
+func ClusterOf(id int) int {
+	if id <= 0 {
+		return -1
+	}
+	return (id - 1) / MAX_NODES
 }

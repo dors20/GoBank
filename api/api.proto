@@ -9,6 +9,9 @@ service ClientServerTxns {
     rpc SimulateNodeFailure(Blank) returns (Blank);
     rpc SimulateLeaderFailure(Blank) returns (Blank);
     rpc RecoverNode(Blank) returns (Blank);
+    rpc GetBalance(BalanceRequest) returns (BalanceReply);
+    rpc Prepare2PC(Prepare2PCRequest) returns (Prepare2PCReply);
+    rpc Decide2PC(Decide2PCRequest) returns (Blank);
 }
 
 service PaxosReplication {
@@ -64,6 +67,8 @@ message LogRecord {
     int32 amount = 6;
     bool isCommitted = 7;
     int64 timestamp = 8;
+    string phase = 9;
+    string txId = 10;
 }
 
 message Logs {
@@ -72,6 +77,37 @@ message Logs {
 
 message Vault {
     map<string, int32> vault =1;
+}
+
+message BalanceRequest {
+    string account = 1;
+}
+
+message BalanceReply {
+    int32 balance = 1;
+    bool found = 2;
+}
+
+message Prepare2PCRequest {
+    string sender = 1;
+    string receiver = 2;
+    int32 amount = 3;
+    string txId = 4;
+    int64 timestamp = 5;
+}
+
+message Prepare2PCReply {
+    bool prepared = 1;
+    string error = 2;
+}
+
+message Decide2PCRequest {
+    string txId = 1;
+    string sender = 2;
+    string receiver = 3;
+    int32 amount = 4;
+    bool commit = 5;
+    int64 timestamp = 6;
 }
 
 message RequestInfo {
