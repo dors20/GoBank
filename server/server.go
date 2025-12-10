@@ -510,14 +510,10 @@ func (s *ServerImpl) Request(ctx context.Context, in *api.Message) (*api.Reply, 
 		logs.Infof("First request from client %s. Creating client cache", in.ClientId)
 	}
 
-	if in.GetTimestamp() <= client.lastRequestTimeStamp {
+	if in.GetTimestamp() <= client.lastRequestTimeStamp && client.lastResponse != nil {
 		logs.Infof("Recieved duplicate request from client-%s", in.ClientId)
 		resp := client.lastResponse
 		s.clientManager.lock.Unlock()
-		if resp == nil {
-			resp = &api.Reply{Result: false, ServerId: int32(s.id), Error: "Invalid stale request not found in cache"}
-		}
-
 		return resp, nil
 	}
 	client.lastRequestTimeStamp = in.GetTimestamp()
@@ -578,6 +574,7 @@ func (s *ServerImpl) Request(ctx context.Context, in *api.Message) (*api.Reply, 
 	quorum := int((constants.MAX_NODES / 2) + 1)
 
 	ok = false
+	attempts := 0
 	for !ok {
 		s.lock.Lock()
 		isLeader := s.state == constants.Leader
@@ -596,6 +593,10 @@ func (s *ServerImpl) Request(ctx context.Context, in *api.Message) (*api.Reply, 
 		}
 		s.lock.Unlock()
 		ok = s.peerManager.broadcastAccept(quorum, record, in.GetTimestamp())
+		attempts++
+		if !ok && attempts >= 3 {
+			return &api.Reply{Result: false, ServerId: int32(s.id), Error: "INSUFFICIENT_QUORUM"}, nil
+		}
 	}
 
 	logStore.markCommitted(currSeqNum)
@@ -681,7 +682,7 @@ func (s *ServerImpl) handleCrossShardRequest(ctx context.Context, in *api.Messag
 		Timestamp: in.GetTimestamp(),
 	}
 	prepResp, err := client.Prepare2PC(pctx, prepReq)
-	if err != nil || prepResp == nil || !prepResp.Prepared {
+	if err != nil || prepResp == nil {
 		s.proposeLogWithPhase("A", txID, in.Sender, in.Receiver, int(in.Amount), in.GetTimestamp())
 		sm.restoreBalances(txID)
 		sm.unlockAccounts(in.Sender)
@@ -696,7 +697,28 @@ func (s *ServerImpl) handleCrossShardRequest(ctx context.Context, in *api.Messag
 			Timestamp: in.GetTimestamp(),
 		}
 		client.Decide2PC(dctx, decideReq)
-		return &api.Reply{Result: false, ServerId: int32(s.id), Error: "ABORTED"}, nil
+		return &api.Reply{Result: false, ServerId: int32(s.id), Error: "INSUFFICIENT_QUORUM"}, nil
+	}
+	if !prepResp.Prepared {
+		errMsg := prepResp.GetError()
+		if errMsg == "" {
+			errMsg = "INSUFFICIENT_QUORUM"
+		}
+		s.proposeLogWithPhase("A", txID, in.Sender, in.Receiver, int(in.Amount), in.GetTimestamp())
+		sm.restoreBalances(txID)
+		sm.unlockAccounts(in.Sender)
+		dctx, dcancel := context.WithTimeout(context.Background(), constants.REQUEST_TIMEOUT*time.Millisecond)
+		defer dcancel()
+		decideReq := &api.Decide2PCRequest{
+			TxId:      txID,
+			Sender:    in.Sender,
+			Receiver:  in.Receiver,
+			Amount:    in.Amount,
+			Commit:    false,
+			Timestamp: in.GetTimestamp(),
+		}
+		client.Decide2PC(dctx, decideReq)
+		return &api.Reply{Result: false, ServerId: int32(s.id), Error: errMsg}, nil
 	}
 
 	localCommit, res := s.proposeLogWithPhase("C", txID, in.Sender, in.Receiver, int(in.Amount), in.GetTimestamp())
@@ -715,7 +737,7 @@ func (s *ServerImpl) handleCrossShardRequest(ctx context.Context, in *api.Messag
 			Timestamp: in.GetTimestamp(),
 		}
 		client.Decide2PC(dctx, decideReq)
-		return &api.Reply{Result: false, ServerId: int32(s.id), Error: "COMMIT_FAILED"}, nil
+		return &api.Reply{Result: false, ServerId: int32(s.id), Error: "INSUFFICIENT_QUORUM"}, nil
 	}
 
 	dctx, dcancel := context.WithTimeout(context.Background(), constants.REQUEST_TIMEOUT*time.Millisecond)
@@ -766,6 +788,7 @@ func (s *ServerImpl) proposeLogWithPhase(phase string, txID string, sender strin
 	quorum := int((constants.MAX_NODES / 2) + 1)
 
 	ok := false
+	attempts := 0
 	for !ok {
 		s.lock.Lock()
 		isLeader := s.state == constants.Leader
@@ -784,10 +807,15 @@ func (s *ServerImpl) proposeLogWithPhase(phase string, txID string, sender strin
 		}
 		s.lock.Unlock()
 		ok = s.peerManager.broadcastAccept(quorum, record, timestamp)
+		attempts++
+		if !ok && attempts >= 3 {
+			return false, false
+		}
 	}
 
 	logStore.markCommitted(currSeqNum)
 	sm.applyTxn()
+	s.peerManager.broadcastCommit(record)
 	return true, true
 }
 
@@ -931,29 +959,36 @@ func (sm *StateMachine) execCommitLogs() {
 		sender := logToApply.Txn.Sender
 		reciever := logToApply.Txn.Reciever
 
-		if _, ok := sm.vault[sender]; !ok {
-			sm.vault[sender] = constants.INITIAL_BALANCE
-			logs.Infof("Detected new user, Initializing Balance for User: %s with %d", sender, constants.INITIAL_BALANCE)
+		cluster := constants.ClusterOf(server.id)
+		senderShard := shardOfAccount(sender)
+		receiverShard := shardOfAccount(reciever)
+
+		if senderShard != -1 && senderShard == cluster {
+			if _, ok := sm.vault[sender]; !ok {
+				sm.vault[sender] = constants.INITIAL_BALANCE
+				logs.Infof("Detected new user, Initializing Balance for User: %s with %d", sender, constants.INITIAL_BALANCE)
+			}
 		}
-		if _, ok := sm.vault[reciever]; !ok {
-			sm.vault[reciever] = constants.INITIAL_BALANCE
+		if receiverShard != -1 && receiverShard == cluster {
+			if _, ok := sm.vault[reciever]; !ok {
+				sm.vault[reciever] = constants.INITIAL_BALANCE
+			}
 		}
 
 		var res bool
 		walToDelete := ""
 		phase := logToApply.Phase
 		if phase == "" || phase == "N" {
-			if sm.vault[sender] >= logToApply.Txn.Amount {
-				sm.vault[sender] -= logToApply.Txn.Amount
-				sm.vault[reciever] += logToApply.Txn.Amount
-				res = true
+			if senderShard == cluster && receiverShard == cluster {
+				if sm.vault[sender] >= logToApply.Txn.Amount {
+					sm.vault[sender] -= logToApply.Txn.Amount
+					sm.vault[reciever] += logToApply.Txn.Amount
+					res = true
+				}
 			}
 		} else if phase == "P" {
 			res = true
 		} else if phase == "C" {
-			cluster := constants.ClusterOf(server.id)
-			senderShard := shardOfAccount(sender)
-			receiverShard := shardOfAccount(reciever)
 			if senderShard != -1 && cluster == senderShard {
 				if sm.vault[sender] >= logToApply.Txn.Amount {
 					sm.vault[sender] -= logToApply.Txn.Amount

@@ -47,9 +47,31 @@ var ServerPorts = map[int]string{
 	9: "9119",
 }
 
+// cluster 0: servers 1,2,3
+// cluster 1: servers 4,5,6
+// cluster 2: servers 7,8,9
+var ClusterServers = map[int][]int{
+	0: {1, 2, 3},
+	1: {4, 5, 6},
+	2: {7, 8, 9},
+}
+
 func ClusterOf(id int) int {
 	if id <= 0 {
 		return -1
 	}
 	return (id - 1) / MAX_NODES
+}
+
+func ClusterForAccountID(id int) int {
+	if id >= 1 && id <= 3000 {
+		return 0
+	}
+	if id >= 3001 && id <= 6000 {
+		return 1
+	}
+	if id >= 6001 && id <= 9000 {
+		return 2
+	}
+	return -1
 }
