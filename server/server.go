@@ -144,6 +144,9 @@ var server *ServerImpl
 var logStore *LogStore
 var sm *StateMachine
 var logs *zap.SugaredLogger
+var overrideShard map[int]int
+
+const reshardMappingFile = "reshard_mapping.json"
 
 func dbPathForServer(id int) string {
 	return filepath.Join("data", fmt.Sprintf("server_%d", id))
@@ -156,6 +159,11 @@ func shardOfAccount(account string) int {
 	n, err := strconv.Atoi(account)
 	if err != nil {
 		return -1
+	}
+	if overrideShard != nil {
+		if c, ok := overrideShard[n]; ok {
+			return c
+		}
 	}
 	if n >= 1 && n <= 3000 {
 		return 0
@@ -182,6 +190,28 @@ func openDB(id int) *badger.DB {
 		logs.Fatalf("Failed to open DB at %s: %v", path, err)
 	}
 	return db
+}
+
+func loadReshardMapping() map[int]int {
+	data, err := os.ReadFile(reshardMappingFile)
+	if err != nil {
+		return nil
+	}
+	var raw map[string]int
+	if err := json.Unmarshal(data, &raw); err != nil {
+		logs.Warnf("Failed to parse reshard mapping: %v", err)
+		return nil
+	}
+	m := make(map[int]int, len(raw))
+	for k, v := range raw {
+		id, err := strconv.Atoi(k)
+		if err != nil {
+			continue
+		}
+		m[id] = v
+	}
+	logs.Infof("Loaded reshard mapping for %d accounts", len(m))
+	return m
 }
 
 func loadStateFromDB() {
@@ -450,7 +480,7 @@ func main() {
 	leaderTimeout := constants.LEADER_TIMEOUT_SECONDS * time.Millisecond
 	startServer(serverId, leaderTimeout)
 	logs.Infof("Server-%d is up and running. Waiting for requests on port %s", serverId, server.port)
-
+	overrideShard = loadReshardMapping()
 	// Starting grpc server
 	addr := fmt.Sprintf(":%s", server.port)
 	lis, err := net.Listen("tcp", addr)

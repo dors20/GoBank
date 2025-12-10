@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"context"
 	"encoding/csv"
+	"encoding/json"
 	"fmt"
 	"io"
 	"math/rand"
@@ -78,6 +79,10 @@ func ensureServerBinary() error {
 var clientStateManager map[string]*clientState
 var lastPrintedViewIndex map[int]int
 var cm sync.Mutex
+var reshardMapping map[int]int
+var crossShardHistory [][2]int
+
+const reshardMappingFile = "reshard_mapping.json"
 
 type CmdType int
 
@@ -151,6 +156,8 @@ func main() {
 		logs.Fatalf("Failed to build server binary: %v", err)
 	}
 	defer os.Remove("server_bin")
+
+	reshardMapping = loadReshardMapping()
 
 	testSets, err := parseTestCasesForClient(testFilePath)
 	if err != nil {
@@ -308,20 +315,161 @@ func parseTestCasesForClient(path string) ([]InputSet, error) {
 	return sets, nil
 }
 
-func leaderForAccount(account int) int {
-	clusterID := constants.ClusterForAccountID(account)
-	if clusterID < 0 {
-		return 1
+func loadReshardMapping() map[int]int {
+	data, err := os.ReadFile(reshardMappingFile)
+	if err != nil {
+		return nil
 	}
-	servers, ok := constants.ClusterServers[clusterID]
-	if !ok || len(servers) == 0 {
-		return 1
+	var raw map[string]int
+	if err := json.Unmarshal(data, &raw); err != nil {
+		fmt.Printf("Failed to parse reshard mapping: %v\n", err)
+		return nil
 	}
-	// Use the first server in the cluster as the initial contact;
-	// the server will forward to the current leader if needed.
-	return servers[0]
+	m := make(map[int]int, len(raw))
+	for k, v := range raw {
+		id, err := strconv.Atoi(k)
+		if err != nil {
+			continue
+		}
+		m[id] = v
+	}
+	return m
 }
 
+func saveReshardMapping(m map[int]int) error {
+	raw := make(map[string]int, len(m))
+	for k, v := range m {
+		raw[strconv.Itoa(k)] = v
+	}
+	data, err := json.MarshalIndent(raw, "", "  ")
+	if err != nil {
+		return err
+	}
+	return os.WriteFile(reshardMappingFile, data, 0644)
+}
+
+func clusterForAccountDynamic(account int) int {
+	if reshardMapping != nil {
+		if c, ok := reshardMapping[account]; ok {
+			return c
+		}
+	}
+	return constants.ClusterForAccountID(account)
+}
+
+func recordCrossShard(sender, receiver int) {
+	if clusterForAccountDynamic(sender) != clusterForAccountDynamic(receiver) {
+		crossShardHistory = append(crossShardHistory, [2]int{sender, receiver})
+	}
+}
+
+func computeReshardMapping(history [][2]int) map[int]int {
+	if len(history) == 0 {
+		return nil
+	}
+	adj := make(map[int]map[int]int)
+	nodeSet := make(map[int]struct{})
+	for _, h := range history {
+		a, b := h[0], h[1]
+		nodeSet[a] = struct{}{}
+		nodeSet[b] = struct{}{}
+		if adj[a] == nil {
+			adj[a] = make(map[int]int)
+		}
+		if adj[b] == nil {
+			adj[b] = make(map[int]int)
+		}
+		adj[a][b]++
+		adj[b][a]++
+	}
+
+	type degNode struct {
+		id  int
+		deg int
+	}
+	var order []degNode
+	for n := range nodeSet {
+		deg := 0
+		for _, w := range adj[n] {
+			deg += w
+		}
+		order = append(order, degNode{id: n, deg: deg})
+	}
+	slices.SortFunc(order, func(a, b degNode) int {
+		if a.deg == b.deg {
+			return a.id - b.id
+		}
+		return b.deg - a.deg
+	})
+
+	shards := make([][]int, constants.NUM_CLUSTERS)
+	assign := make(map[int]int)
+	target := (len(order) + constants.NUM_CLUSTERS - 1) / constants.NUM_CLUSTERS
+
+	for _, dn := range order {
+		bestShard := 0
+		bestScore := -1
+		for s := 0; s < constants.NUM_CLUSTERS; s++ {
+			if len(shards[s]) > target+1 {
+				continue
+			}
+			score := 0
+			for _, n := range shards[s] {
+				score += adj[dn.id][n]
+			}
+			if score > bestScore || (score == bestScore && len(shards[s]) < len(shards[bestShard])) {
+				bestShard = s
+				bestScore = score
+			}
+		}
+		shards[bestShard] = append(shards[bestShard], dn.id)
+		assign[dn.id] = bestShard
+	}
+
+	return assign
+}
+
+func baseClusterForAccount(prev map[int]int, acc int) int {
+	if prev != nil {
+		if c, ok := prev[acc]; ok {
+			return c
+		}
+	}
+	return constants.ClusterForAccountID(acc)
+}
+
+func printReshardMapping(newMap map[int]int, prev map[int]int) {
+	if newMap == nil {
+		fmt.Println("No reshard mapping computed.")
+		return
+	}
+	type move struct {
+		acc int
+		src int
+		dst int
+	}
+	var moves []move
+	for acc, dst := range newMap {
+		src := baseClusterForAccount(prev, acc)
+		if src == dst {
+			continue
+		}
+		moves = append(moves, move{acc: acc, src: src, dst: dst})
+	}
+	if len(moves) == 0 {
+		fmt.Println("No account movement (mapping unchanged).")
+		return
+	}
+	slices.SortFunc(moves, func(a, b move) int {
+		if a.acc == b.acc {
+			return a.dst - b.dst
+		}
+		return a.acc - b.acc
+	})
+	for _, m := range moves {
+		fmt.Printf("(%d,c%d,c%d)\n", m.acc, m.src+1, m.dst+1)
+	}
+}
 func runSetWithManagerCLI(m *TestCaseManager, set InputSet, stats *perfStats) error {
 	logs.Debug("Enter")
 	defer logs.Debug("Exit")
@@ -343,7 +491,8 @@ func runSetWithManagerCLI(m *TestCaseManager, set InputSet, stats *perfStats) er
 			wg.Add(1)
 			go func() {
 				defer wg.Done()
-				clusterID := constants.ClusterForAccountID(c.Sender)
+				clusterID := clusterForAccountDynamic(c.Sender)
+				recordCrossShard(c.Sender, c.Receiver)
 				serverIDs, ok := constants.ClusterServers[clusterID]
 				if !ok || len(serverIDs) == 0 {
 					logs.Warnf("Transfer txn in set %d from %d to %d amount=%d has no servers for cluster %d", set.SetNumber, c.Sender, c.Receiver, c.Amount, clusterID)
@@ -380,7 +529,6 @@ func runSetWithManagerCLI(m *TestCaseManager, set InputSet, stats *perfStats) er
 						continue
 					}
 					if reply.Error != "" {
-						// Treat business-logic rejections as final, everything else retryable.
 						if strings.Contains(reply.Error, "INSUFFICIENT_BALANCE") ||
 							// strings.Contains(reply.Error, "LOCK_CONFLICT") ||
 							strings.Contains(reply.Error, "INSUFFICIENT_QUORUM") {
@@ -408,7 +556,7 @@ func runSetWithManagerCLI(m *TestCaseManager, set InputSet, stats *perfStats) er
 			wg.Add(1)
 			go func() {
 				defer wg.Done()
-				clusterID := constants.ClusterForAccountID(c.Account)
+				clusterID := clusterForAccountDynamic(c.Account)
 				serverIDs, ok := constants.ClusterServers[clusterID]
 				if !ok || len(serverIDs) == 0 {
 					logs.Warnf("Read-only txn in set %d for account %d has no servers for cluster %d", set.SetNumber, c.Account, clusterID)
@@ -465,7 +613,7 @@ func runSetWithManagerCLI(m *TestCaseManager, set InputSet, stats *perfStats) er
 }
 
 func cliPrintBalance(m *TestCaseManager, account int) {
-	clusterID := constants.ClusterForAccountID(account)
+	clusterID := clusterForAccountDynamic(account)
 	if clusterID < 0 {
 		fmt.Printf("Could not determine cluster for account %d\n", account)
 		return
@@ -502,22 +650,28 @@ func cliPrintDB(m *TestCaseManager) {
 	logs.Debug("Enter")
 	defer logs.Debug("Exit")
 
-	maxID := m.maxServerID()
-	for sid := 1; sid <= maxID; sid++ {
-		client, err := m.getPrintClient(sid)
-		if err != nil {
-			fmt.Printf("PrintDB: server %d unavailable: %v\n", sid, err)
+	for cluster := 0; cluster < constants.NUM_CLUSTERS; cluster++ {
+		sids, ok := constants.ClusterServers[cluster]
+		if !ok || len(sids) == 0 {
 			continue
 		}
-		ctx, cancel := context.WithTimeout(context.Background(), constants.REQUEST_TIMEOUT*time.Millisecond)
-		db, err := client.PrintDB(ctx, &api.Blank{})
-		cancel()
-		if err != nil {
-			fmt.Printf("PrintDB failed for server %d: %v\n", sid, err)
-			continue
+		fmt.Printf("Cluster %d:\n", cluster)
+		for _, sid := range sids {
+			client, err := m.getPrintClient(sid)
+			if err != nil {
+				fmt.Printf("  Server %d unavailable: %v\n", sid, err)
+				continue
+			}
+			ctx, cancel := context.WithTimeout(context.Background(), constants.REQUEST_TIMEOUT*time.Millisecond)
+			db, err := client.PrintDB(ctx, &api.Blank{})
+			cancel()
+			if err != nil {
+				fmt.Printf("  Server %d PrintDB failed: %v\n", sid, err)
+				continue
+			}
+			logs.Infof("*PRINT DB* Server %d Vault: %v", sid, db.GetVault())
+			fmt.Printf("  Server %d Vault: %v\n", sid, db.GetVault())
 		}
-		logs.Infof("*PRINT DB* Server %d Vault: %v", sid, db.GetVault())
-		fmt.Printf("*PRINT DB* Server %d Vault: %v\n", sid, db.GetVault())
 	}
 }
 
@@ -566,34 +720,36 @@ func printPerformance(stats *perfStats) {
 	fmt.Printf("Performance: txns=%d throughput=%.2f txns/s avg-latency=%.3f ms max-latency=%.3f ms\n", stats.txnCount, throughput, avgLatencyMs, float64(stats.maxLatency.Milliseconds()))
 }
 
-func cliPrintReshard() {
-	fmt.Println("Resharding not implemented.")
-}
-
 func cliPrintLogs(m *TestCaseManager) {
 	logs.Debug("Enter")
 	defer logs.Debug("Exit")
 
-	maxID := m.maxServerID()
-	for sid := 1; sid <= maxID; sid++ {
-		client, err := m.getPrintClient(sid)
-		if err != nil {
-			fmt.Printf("PrintLog: server %d unavailable: %v\n", sid, err)
+	for cluster := 0; cluster < constants.NUM_CLUSTERS; cluster++ {
+		sids, ok := constants.ClusterServers[cluster]
+		if !ok || len(sids) == 0 {
 			continue
 		}
-		ctx, cancel := context.WithTimeout(context.Background(), constants.REQUEST_TIMEOUT*time.Millisecond)
-		logStore, err := client.PrintLog(ctx, &api.Blank{})
-		cancel()
-		if err != nil {
-			fmt.Printf("PrintLog failed for server %d: %v\n", sid, err)
-			continue
-		}
-		fmt.Printf("Server %d Log:\n", sid)
-		for _, entry := range logStore.GetLogs() {
-			logs.Infof("*PRINT LOGS* - Seq: %d, From: %s, To: %s, Amt: %d, Committed: %t, ballotVal: %d, serverID: %d, phase: %s, txId: %s",
-				entry.GetSeqNum(), entry.GetSender(), entry.GetReceiver(), entry.GetAmount(), entry.GetIsCommitted(), entry.GetBallotVal(), entry.ServerId, entry.GetPhase(), entry.GetTxId())
-			fmt.Printf("*PRINT LOGS* - Seq: %d, From: %s, To: %s, Amt: %d, Committed: %t, ballotVal: %d, serverID: %d, phase: %s, txId: %s\n",
-				entry.GetSeqNum(), entry.GetSender(), entry.GetReceiver(), entry.GetAmount(), entry.GetIsCommitted(), entry.GetBallotVal(), entry.ServerId, entry.GetPhase(), entry.GetTxId())
+		fmt.Printf("Cluster %d:\n", cluster)
+		for _, sid := range sids {
+			client, err := m.getPrintClient(sid)
+			if err != nil {
+				fmt.Printf("  Server %d unavailable: %v\n", sid, err)
+				continue
+			}
+			ctx, cancel := context.WithTimeout(context.Background(), constants.REQUEST_TIMEOUT*time.Millisecond)
+			logStore, err := client.PrintLog(ctx, &api.Blank{})
+			cancel()
+			if err != nil {
+				fmt.Printf("  PrintLog failed for server %d: %v\n", sid, err)
+				continue
+			}
+			fmt.Printf("  Server %d Log:\n", sid)
+			for _, entry := range logStore.GetLogs() {
+				logs.Infof("*PRINT LOGS* - Seq: %d, From: %s, To: %s, Amt: %d, Committed: %t, ballotVal: %d, serverID: %d, phase: %s, txId: %s",
+					entry.GetSeqNum(), entry.GetSender(), entry.GetReceiver(), entry.GetAmount(), entry.GetIsCommitted(), entry.GetBallotVal(), entry.ServerId, entry.GetPhase(), entry.GetTxId())
+				fmt.Printf("    *PRINT LOGS* - Seq: %d, From: %s, To: %s, Amt: %d, Committed: %t, ballotVal: %d, serverID: %d, phase: %s, txId: %s\n",
+					entry.GetSeqNum(), entry.GetSender(), entry.GetReceiver(), entry.GetAmount(), entry.GetIsCommitted(), entry.GetBallotVal(), entry.ServerId, entry.GetPhase(), entry.GetTxId())
+			}
 		}
 	}
 }
@@ -650,6 +806,7 @@ func runCLI(testSets []InputSet) {
 				manager.Stop()
 				manager = nil
 			}
+			reshardMapping = loadReshardMapping()
 			if currentIndex+1 >= len(testSets) {
 				fmt.Println("All test sets have been processed.")
 				continue
@@ -735,7 +892,24 @@ func runCLI(testSets []InputSet) {
 			logs.Infof("CLI performance for current set index %d", currentIndex)
 			printPerformance(stats)
 		case "printreshard":
-			cliPrintReshard()
+			if manager != nil {
+				logs.Infof("Stopping current manager before reshard")
+				manager.Stop()
+				manager = nil
+			}
+			prev := reshardMapping
+			mapping := computeReshardMapping(crossShardHistory)
+			if mapping == nil {
+				fmt.Println("No cross-shard history to compute reshard mapping.")
+				continue
+			}
+			if err := saveReshardMapping(mapping); err != nil {
+				fmt.Printf("Failed to save reshard mapping: %v\n", err)
+			} else {
+				reshardMapping = mapping
+				fmt.Println("Reshard mapping computed and saved.")
+			}
+			printReshardMapping(mapping, prev)
 		case "help":
 			fmt.Println("Commands: next, skip, printbalance <account>, printdb, printview, performance, exit, help")
 		case "exit":
@@ -923,9 +1097,6 @@ func broadcastRequest(req *api.Message) *api.Reply {
 	return nil
 }
 
-// Good to have for performance
-// Unlock before creating a new connection because it might take time
-// Reaquire lock and then add it to server map
 func (sm *serversData) getClientServerConn() (api.ClientServerTxnsClient, error) {
 	logs.Debug("Enter")
 	defer logs.Debug("Exit")
