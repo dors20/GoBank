@@ -627,7 +627,7 @@ func (s *ServerImpl) Request(ctx context.Context, in *api.Message) (*api.Reply, 
 
 }
 
-func (s *ServerImpl) handleCrossShardRequest(ctx context.Context, in *api.Message, senderShard int, receiverShard int) (*api.Reply, error) {
+func (s *ServerImpl) handleCrossShardRequest(ctx context.Context, in *api.Message, _ int, receiverShard int) (*api.Reply, error) {
 	txID := fmt.Sprintf("%s:%s:%d:%d", in.Sender, in.Receiver, in.Amount, in.Timestamp)
 	if !sm.tryLockAccounts(in.Sender) {
 		return &api.Reply{Result: false, ServerId: int32(s.id), Error: "LOCK_CONFLICT"}, nil
@@ -924,16 +924,6 @@ func (sm *StateMachine) restoreBalances(txID string) {
 	for acc, bal := range entry {
 		sm.vault[acc] = bal
 	}
-	delete(sm.wal, txID)
-	sm.lock.Unlock()
-	deleteWAL(txID)
-}
-
-func (sm *StateMachine) clearWAL(txID string) {
-	if txID == "" {
-		return
-	}
-	sm.lock.Lock()
 	delete(sm.wal, txID)
 	sm.lock.Unlock()
 	deleteWAL(txID)
@@ -2073,9 +2063,6 @@ func (s *ServerImpl) logCatchupLoop() {
 }
 
 func (ls *LogStore) marshal() {
-}
-
-func (ls *LogStore) unmarshal() {
 }
 
 func (s *ServerImpl) startLogCatchup() {
