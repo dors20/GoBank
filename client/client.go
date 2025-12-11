@@ -790,7 +790,7 @@ func parseBenchmarkArgs(args []string) (benchmarkConfig, error) {
 		outPath:      "benchmark.csv",
 		txns:         1000,
 		readPct:      30,
-		crossPct:     30,
+		crossPct:     10,
 		skew:         0,
 		distribution: "uniform",
 	}
@@ -925,6 +925,210 @@ func runBenchmark(cfg benchmarkConfig) error {
 	return nil
 }
 
+func runSetReadCommitted(m *TestCaseManager, set InputSet) error {
+	logs.Debug("Enter")
+	defer logs.Debug("Exit")
+
+	logs.Infof("Executing read-committed set %d with %d commands and live nodes %v", set.SetNumber, len(set.Commands), set.LiveNodes)
+	for _, cmd := range set.Commands {
+		switch cmd.Type {
+		case CmdTransfer:
+			if err := runSingleTransfer(m, set, cmd); err != nil {
+				logs.Warnf("Read-committed transfer in set %d failed: %v", set.SetNumber, err)
+			}
+		case CmdRead:
+			if err := runSingleReadCommitted(m, set, cmd); err != nil {
+				logs.Warnf("Read-committed read in set %d failed: %v", set.SetNumber, err)
+			}
+		case CmdFail:
+			if err := m.FailNode(cmd.NodeID); err != nil {
+				logs.Warnf("FailNode(%d) issued in set %d failed: %v", cmd.NodeID, set.SetNumber, err)
+			} else {
+				logs.Infof("FailNode(%d) issued in set %d", cmd.NodeID, set.SetNumber)
+			}
+		case CmdRecover:
+			if err := m.RecoverNode(cmd.NodeID); err != nil {
+				logs.Warnf("RecoverNode(%d) issued in set %d failed: %v", cmd.NodeID, set.SetNumber, err)
+			} else {
+				logs.Infof("RecoverNode(%d) issued in set %d", cmd.NodeID, set.SetNumber)
+			}
+		}
+	}
+	logs.Infof("Finished read-committed set %d", set.SetNumber)
+	return nil
+}
+
+func runSetEventual(m *TestCaseManager, set InputSet) error {
+	logs.Debug("Enter")
+	defer logs.Debug("Exit")
+
+	logs.Infof("Executing eventual set %d with %d commands and live nodes %v", set.SetNumber, len(set.Commands), set.LiveNodes)
+	for _, cmd := range set.Commands {
+		switch cmd.Type {
+		case CmdTransfer:
+			if err := runSingleTransfer(m, set, cmd); err != nil {
+				logs.Warnf("Eventual transfer in set %d failed: %v", set.SetNumber, err)
+			}
+		case CmdRead:
+			if err := runSingleEventualRead(m, set, cmd); err != nil {
+				logs.Warnf("Eventual read in set %d failed: %v", set.SetNumber, err)
+			}
+		case CmdFail:
+			if err := m.FailNode(cmd.NodeID); err != nil {
+				logs.Warnf("FailNode(%d) issued in set %d failed: %v", cmd.NodeID, set.SetNumber, err)
+			} else {
+				logs.Infof("FailNode(%d) issued in set %d", cmd.NodeID, set.SetNumber)
+			}
+		case CmdRecover:
+			if err := m.RecoverNode(cmd.NodeID); err != nil {
+				logs.Warnf("RecoverNode(%d) issued in set %d failed: %v", cmd.NodeID, set.SetNumber, err)
+			} else {
+				logs.Infof("RecoverNode(%d) issued in set %d", cmd.NodeID, set.SetNumber)
+			}
+		}
+	}
+	logs.Infof("Finished eventual set %d", set.SetNumber)
+	return nil
+}
+
+func runSingleTransfer(m *TestCaseManager, set InputSet, c Cmd) error {
+	clusterID := clusterForAccountDynamic(c.Sender)
+	serverIDs, ok := constants.ClusterServers[clusterID]
+	if !ok || len(serverIDs) == 0 {
+		logs.Warnf("Transfer txn in set %d from %d to %d amount=%d has no servers for cluster %d", set.SetNumber, c.Sender, c.Receiver, c.Amount, clusterID)
+		return nil
+	}
+	recordCrossShard(c.Sender, c.Receiver)
+	ts := time.Now().UnixNano()
+	req := &api.Message{
+		Sender:    strconv.Itoa(c.Sender),
+		Receiver:  strconv.Itoa(c.Receiver),
+		Amount:    int32(c.Amount),
+		ClientId:  fmt.Sprintf("%d_%d", c.Sender, ts),
+		Timestamp: ts,
+	}
+	for attempt := 0; attempt < 20; attempt++ {
+		if attempt > 0 {
+			time.Sleep(time.Duration(constants.LEADER_TIMEOUT_SECONDS) * time.Millisecond)
+		}
+		sid := serverIDs[attempt%len(serverIDs)]
+		client, err := m.getServerClient(sid)
+		if err != nil {
+			logs.Warnf("Transfer txn in set %d from %d to %d amount=%d failed to get client for server-%d: %v", set.SetNumber, c.Sender, c.Receiver, c.Amount, sid, err)
+			continue
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), constants.REQUEST_TIMEOUT*time.Millisecond)
+		start := time.Now()
+		reply, err := client.Request(ctx, req)
+		cancel()
+		_ = start
+		if err != nil {
+			logs.Warnf("Transfer txn in set %d from %d to %d amount=%d via server-%d failed: %v", set.SetNumber, c.Sender, c.Receiver, c.Amount, sid, err)
+			continue
+		}
+		if reply == nil {
+			logs.Warnf("Transfer txn in set %d from %d to %d amount=%d via server-%d returned nil reply", set.SetNumber, c.Sender, c.Receiver, c.Amount, sid)
+			continue
+		}
+		if reply.Error != "" {
+			if strings.Contains(reply.Error, "INSUFFICIENT_BALANCE") ||
+				strings.Contains(reply.Error, "INSUFFICIENT_QUORUM") {
+				logs.Infof("Transfer txn in set %d from %d to %d amount=%d rejected by server-%d: %s", set.SetNumber, c.Sender, c.Receiver, c.Amount, sid, reply.Error)
+				return nil
+			}
+			logs.Infof("Transfer txn in set %d from %d to %d amount=%d via server-%d got retryable error=%s", set.SetNumber, c.Sender, c.Receiver, c.Amount, sid, reply.Error)
+			continue
+		}
+		if !reply.Result {
+			logs.Infof("Transfer txn in set %d from %d to %d amount=%d via server-%d returned result=false (no error). Treating as processed/final.", set.SetNumber, c.Sender, c.Receiver, c.Amount, sid)
+			return nil
+		}
+		logs.Infof("Transfer txn in set %d from %d to %d amount=%d completed via server-%d (leader=%d)", set.SetNumber, c.Sender, c.Receiver, c.Amount, sid, reply.ServerId)
+		return nil
+	}
+	logs.Warnf("Transfer txn in set %d from %d to %d amount=%d exhausted retries in cluster %d", set.SetNumber, c.Sender, c.Receiver, c.Amount, clusterID)
+	return nil
+}
+
+func runSingleReadCommitted(m *TestCaseManager, set InputSet, c Cmd) error {
+	clusterID := clusterForAccountDynamic(c.Account)
+	if clusterID < 0 {
+		logs.Warnf("Read-committed txn in set %d for account %d has invalid cluster", set.SetNumber, c.Account)
+		return nil
+	}
+	serverIDs, ok := constants.ClusterServers[clusterID]
+	if !ok || len(serverIDs) == 0 {
+		logs.Warnf("Read-committed txn in set %d for account %d has no servers for cluster %d", set.SetNumber, c.Account, clusterID)
+		return nil
+	}
+	for _, sid := range serverIDs {
+		client, err := m.getServerClient(sid)
+		if err != nil {
+			continue
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), constants.REQUEST_TIMEOUT*time.Millisecond)
+		resp, err := client.GetBalance(ctx, &api.BalanceRequest{Account: strconv.Itoa(c.Account)})
+		cancel()
+		if err != nil {
+			continue
+		}
+		bal := resp.GetBalance()
+		logs.Infof("Read-committed txn in set %d for account %d via server-%d returned balance=%d", set.SetNumber, c.Account, sid, bal)
+		fmt.Printf("RC READ account=%d balance=%d via n%d\n", c.Account, bal, sid)
+		return nil
+	}
+	logs.Warnf("Read-committed txn in set %d for account %d failed on all replicas", set.SetNumber, c.Account)
+	return nil
+}
+
+func runSingleEventualRead(m *TestCaseManager, set InputSet, c Cmd) error {
+	clusterID := clusterForAccountDynamic(c.Account)
+	if clusterID < 0 {
+		logs.Warnf("Eventual txn in set %d for account %d has invalid cluster", set.SetNumber, c.Account)
+		return nil
+	}
+	serverIDs, ok := constants.ClusterServers[clusterID]
+	if !ok || len(serverIDs) == 0 {
+		logs.Warnf("Eventual txn in set %d for account %d has no servers for cluster %d", set.SetNumber, c.Account, clusterID)
+		return nil
+	}
+	type result struct {
+		sid int
+		bal int32
+		err error
+	}
+	ch := make(chan result, len(serverIDs))
+	var wg sync.WaitGroup
+	for _, sid := range serverIDs {
+		wg.Add(1)
+		go func(serverID int) {
+			defer wg.Done()
+			client, err := m.getServerClient(serverID)
+			if err != nil {
+				ch <- result{sid: serverID, err: err}
+				return
+			}
+			ctx, cancel := context.WithTimeout(context.Background(), constants.REQUEST_TIMEOUT*time.Millisecond)
+			resp, err := client.GetBalance(ctx, &api.BalanceRequest{Account: strconv.Itoa(c.Account)})
+			cancel()
+			if err != nil {
+				ch <- result{sid: serverID, err: err}
+				return
+			}
+			ch <- result{sid: serverID, bal: resp.GetBalance(), err: nil}
+		}(sid)
+	}
+	for i := 0; i < len(serverIDs); i++ {
+		r := <-ch
+		if r.err == nil {
+			logs.Infof("Eventual txn in set %d for account %d via server-%d returned balance=%d", set.SetNumber, c.Account, r.sid, r.bal)
+			fmt.Printf("EVENTUAL READ account=%d balance=%d via n%d\n", c.Account, r.bal, r.sid)
+			return nil
+		}
+	}
+	logs.Warnf("Eventual txn in set %d for account %d failed on all replicas", set.SetNumber, c.Account)
+	return nil
+}
 func cliPrintLogs(m *TestCaseManager) {
 	logs.Debug("Enter")
 	defer logs.Debug("Exit")
@@ -1066,6 +1270,74 @@ func runCLI(testSets []InputSet) {
 			}
 			if err := runBenchmark(cfg); err != nil {
 				fmt.Printf("Benchmark failed: %v\n", err)
+			}
+		case "rc":
+			if manager != nil {
+				logs.Infof("Stopping previous set before read-committed run")
+				manager.Stop()
+				manager = nil
+			}
+			reshardMapping = loadReshardMapping()
+			rcSets, err := parseTestCasesForClient("../read_commited.csv")
+			if err != nil {
+				fmt.Printf("Failed to parse read_commited.csv: %v\n", err)
+				continue
+			}
+			if len(rcSets) == 0 {
+				fmt.Println("No sets found in read_commited.csv")
+				continue
+			}
+			for _, set := range rcSets {
+				fmt.Printf("Running read-committed set %d (%d commands) with live nodes %v\n", set.SetNumber, len(set.Commands), set.LiveNodes)
+				m := NewTestCaseManager()
+				if err := m.Start(set.LiveNodes); err != nil {
+					fmt.Printf("Failed to start servers for read-committed set %d: %v\n", set.SetNumber, err)
+					m.Stop()
+					continue
+				}
+				if err := m.initConnections(); err != nil {
+					fmt.Printf("Failed to init connections for read-committed set %d: %v\n", set.SetNumber, err)
+					m.Stop()
+					continue
+				}
+				if err := runSetReadCommitted(m, set); err != nil {
+					fmt.Printf("Error executing read-committed set %d: %v\n", set.SetNumber, err)
+				}
+				m.Stop()
+			}
+		case "eventual":
+			if manager != nil {
+				logs.Infof("Stopping previous set before eventual run")
+				manager.Stop()
+				manager = nil
+			}
+			reshardMapping = loadReshardMapping()
+			evSets, err := parseTestCasesForClient("../eventual.csv")
+			if err != nil {
+				fmt.Printf("Failed to parse eventual.csv: %v\n", err)
+				continue
+			}
+			if len(evSets) == 0 {
+				fmt.Println("No sets found in eventual.csv")
+				continue
+			}
+			for _, set := range evSets {
+				fmt.Printf("Running eventual set %d (%d commands) with live nodes %v\n", set.SetNumber, len(set.Commands), set.LiveNodes)
+				m := NewTestCaseManager()
+				if err := m.Start(set.LiveNodes); err != nil {
+					fmt.Printf("Failed to start servers for eventual set %d: %v\n", set.SetNumber, err)
+					m.Stop()
+					continue
+				}
+				if err := m.initConnections(); err != nil {
+					fmt.Printf("Failed to init connections for eventual set %d: %v\n", set.SetNumber, err)
+					m.Stop()
+					continue
+				}
+				if err := runSetEventual(m, set); err != nil {
+					fmt.Printf("Error executing eventual set %d: %v\n", set.SetNumber, err)
+				}
+				m.Stop()
 			}
 		case "printbalance":
 			if len(fields) != 2 {
