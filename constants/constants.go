@@ -1,6 +1,10 @@
 package constants
 
-import "go.uber.org/zap"
+import (
+	"sort"
+
+	"go.uber.org/zap"
+)
 
 const (
 	Follower = iota
@@ -9,11 +13,8 @@ const (
 	Failed
 )
 
-// Define other constants like timeouts here
-// TODO
-
 // SYSTEM CONFIG
-const MAX_CLIENTS = 10
+const MAX_CLIENTS = 9000
 const MAX_NODES = 3
 const NUM_CLUSTERS = 3
 const MAX_INFLIGHT = 300
@@ -57,22 +58,117 @@ var ClusterServers = map[int][]int{
 	2: {7, 8, 9},
 }
 
+// var ServerPorts = map[int]string{
+// 	1:  "9111",
+// 	2:  "9112",
+// 	3:  "9113",
+// 	4:  "9114",
+// 	5:  "9115",
+// 	6:  "9116",
+// 	7:  "9117",
+// 	8:  "9118",
+// 	9:  "9119",
+// 	10: "9120",
+// 	11: "9121",
+// 	12: "9122",
+// 	13: "9123",
+// 	14: "9124",
+// 	15: "9125",
+// 	16: "9126",
+// 	17: "9127",
+// 	18: "9128",
+// 	19: "9129",
+// 	20: "9130",
+// 	21: "9131",
+// 	22: "9132",
+// 	23: "9133",
+// 	24: "9134",
+// 	25: "9135",
+// 	26: "9136",
+// }
+
+// cluster 0: servers 1,2,3
+// cluster 1: servers 4,5,6
+// cluster 2: servers 7,8,9
+// var ClusterServers = map[int][]int{
+// 	0: {1, 2, 3, 4, 5},
+// 	1: {6, 7, 8},
+// 	2: {9, 10, 11, 12, 13, 14, 15},
+// }
+
+func NumClusters() int {
+	return len(ClusterServers)
+}
+
+func ClusterIDs() []int {
+	ids := make([]int, 0, len(ClusterServers))
+	for id := range ClusterServers {
+		ids = append(ids, id)
+	}
+	sort.Ints(ids)
+	return ids
+}
+
 func ClusterOf(id int) int {
+	return ClusterOfServer(id)
+}
+
+func ClusterOfServer(id int) int {
 	if id <= 0 {
 		return -1
 	}
-	return (id - 1) / MAX_NODES
+	for cid, servers := range ClusterServers {
+		for _, sid := range servers {
+			if sid == id {
+				return cid
+			}
+		}
+	}
+	return -1
+}
+
+func ClusterSize(clusterID int) int {
+	servers, ok := ClusterServers[clusterID]
+	if !ok {
+		return 0
+	}
+	return len(servers)
+}
+
+func ClusterLeader(clusterID int) int {
+	servers, ok := ClusterServers[clusterID]
+	if !ok || len(servers) == 0 {
+		return -1
+	}
+	return servers[0]
+}
+
+func ClusterQuorum(clusterID int) int {
+	size := ClusterSize(clusterID)
+	if size == 0 {
+		return 0
+	}
+	return size/2 + 1
 }
 
 func ClusterForAccountID(id int) int {
-	if id >= 1 && id <= 3000 {
-		return 0
+	if id <= 0 || id > MAX_CLIENTS {
+		return -1
 	}
-	if id >= 3001 && id <= 6000 {
-		return 1
+	n := NumClusters()
+	if n <= 0 {
+		return -1
 	}
-	if id >= 6001 && id <= 9000 {
-		return 2
+	segment := MAX_CLIENTS / n
+	if segment <= 0 {
+		return -1
 	}
-	return -1
+	for cluster := 0; cluster < n-1; cluster++ {
+		start := cluster*segment + 1
+		end := (cluster + 1) * segment
+		if id >= start && id <= end {
+			return cluster
+		}
+	}
+	return n - 1
 }

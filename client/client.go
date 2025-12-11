@@ -150,9 +150,10 @@ func newClusterLimiter(limit int) *clusterLimiter {
 	if limit <= 0 {
 		return &clusterLimiter{limit: 0}
 	}
-	sem := make(map[int]chan struct{}, constants.NUM_CLUSTERS)
-	for i := 0; i < constants.NUM_CLUSTERS; i++ {
-		sem[i] = make(chan struct{}, limit)
+	clusterIDs := constants.ClusterIDs()
+	sem := make(map[int]chan struct{}, len(clusterIDs))
+	for _, id := range clusterIDs {
+		sem[id] = make(chan struct{}, limit)
 	}
 	return &clusterLimiter{limit: limit, sem: sem}
 }
@@ -359,6 +360,9 @@ func loadReshardMapping() map[int]int {
 		if err != nil {
 			continue
 		}
+		if constants.ClusterSize(v) == 0 {
+			continue
+		}
 		m[id] = v
 	}
 	return m
@@ -430,28 +434,32 @@ func computeReshardMapping(history [][2]int) map[int]int {
 		return b.deg - a.deg
 	})
 
-	shards := make([][]int, constants.NUM_CLUSTERS)
+	clusterIDs := constants.ClusterIDs()
+	if len(clusterIDs) == 0 {
+		return nil
+	}
+	shards := make(map[int][]int, len(clusterIDs))
 	assign := make(map[int]int)
-	target := (len(order) + constants.NUM_CLUSTERS - 1) / constants.NUM_CLUSTERS
+	target := (len(order) + len(clusterIDs) - 1) / len(clusterIDs)
 
 	for _, dn := range order {
-		bestShard := 0
+		bestCluster := clusterIDs[0]
 		bestScore := -1
-		for s := 0; s < constants.NUM_CLUSTERS; s++ {
-			if len(shards[s]) > target+1 {
+		for _, cid := range clusterIDs {
+			if len(shards[cid]) > target+1 {
 				continue
 			}
 			score := 0
-			for _, n := range shards[s] {
+			for _, n := range shards[cid] {
 				score += adj[dn.id][n]
 			}
-			if score > bestScore || (score == bestScore && len(shards[s]) < len(shards[bestShard])) {
-				bestShard = s
+			if score > bestScore || (score == bestScore && len(shards[cid]) < len(shards[bestCluster])) {
+				bestCluster = cid
 				bestScore = score
 			}
 		}
-		shards[bestShard] = append(shards[bestShard], dn.id)
-		assign[dn.id] = bestShard
+		shards[bestCluster] = append(shards[bestCluster], dn.id)
+		assign[dn.id] = bestCluster
 	}
 
 	return assign
@@ -697,7 +705,7 @@ func cliPrintDB(m *TestCaseManager) {
 	logs.Debug("Enter")
 	defer logs.Debug("Exit")
 
-	for cluster := 0; cluster < constants.NUM_CLUSTERS; cluster++ {
+	for _, cluster := range constants.ClusterIDs() {
 		sids, ok := constants.ClusterServers[cluster]
 		if !ok || len(sids) == 0 {
 			continue
@@ -921,7 +929,7 @@ func cliPrintLogs(m *TestCaseManager) {
 	logs.Debug("Enter")
 	defer logs.Debug("Exit")
 
-	for cluster := 0; cluster < constants.NUM_CLUSTERS; cluster++ {
+	for _, cluster := range constants.ClusterIDs() {
 		sids, ok := constants.ClusterServers[cluster]
 		if !ok || len(sids) == 0 {
 			continue

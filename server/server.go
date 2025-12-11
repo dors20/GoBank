@@ -162,19 +162,12 @@ func shardOfAccount(account string) int {
 	}
 	if overrideShard != nil {
 		if c, ok := overrideShard[n]; ok {
-			return c
+			if constants.ClusterSize(c) > 0 {
+				return c
+			}
 		}
 	}
-	if n >= 1 && n <= 3000 {
-		return 0
-	}
-	if n >= 3001 && n <= 6000 {
-		return 1
-	}
-	if n >= 6001 && n <= 9000 {
-		return 2
-	}
-	return -1
+	return constants.ClusterForAccountID(n)
 }
 
 func openDB(id int) *badger.DB {
@@ -206,6 +199,9 @@ func loadReshardMapping() map[int]int {
 	for k, v := range raw {
 		id, err := strconv.Atoi(k)
 		if err != nil {
+			continue
+		}
+		if constants.ClusterSize(v) == 0 {
 			continue
 		}
 		m[id] = v
@@ -444,8 +440,14 @@ func startServer(id int, t time.Duration) {
 		pendingPrepares: make(map[string]*api.PrepareReq),
 		isRunning:       true,
 	}
-	cluster := constants.ClusterOf(id)
-	clusterLeader := cluster*constants.MAX_NODES + 1
+	cluster := constants.ClusterOfServer(id)
+	if cluster < 0 {
+		logs.Fatalf("Server %d not assigned to any cluster", id)
+	}
+	clusterLeader := constants.ClusterLeader(cluster)
+	if clusterLeader < 0 {
+		logs.Fatalf("Cluster %d has no leader configured", cluster)
+	}
 	if id == clusterLeader {
 		server.state = constants.Leader
 		server.ballot.BallotVal = 1
@@ -629,7 +631,7 @@ func (s *ServerImpl) Request(ctx context.Context, in *api.Message) (*api.Reply, 
 	}
 	senderShard := shardOfAccount(in.Sender)
 	receiverShard := shardOfAccount(in.Receiver)
-	serverCluster := constants.ClusterOf(s.id)
+	serverCluster := constants.ClusterOfServer(s.id)
 	if senderShard != -1 && receiverShard != -1 && senderShard != receiverShard && senderShard == serverCluster {
 		s.lock.Unlock()
 		resp, err := s.handleCrossShardRequest(ctx, in, senderShard, receiverShard)
@@ -657,7 +659,8 @@ func (s *ServerImpl) Request(ctx context.Context, in *api.Message) (*api.Reply, 
 
 	logStore.append(record)
 	execChannel := sm.registerSignal(currSeqNum)
-	quorum := int((constants.MAX_NODES / 2) + 1)
+	clusterID := constants.ClusterOfServer(s.id)
+	quorum := constants.ClusterQuorum(clusterID)
 
 	ok = false
 	attempts := 0
@@ -734,9 +737,9 @@ func (s *ServerImpl) handleCrossShardRequest(ctx context.Context, in *api.Messag
 	}
 
 	targetCluster := receiverShard
-	targetLeader := targetCluster*constants.MAX_NODES + 1
+	targetLeader := constants.ClusterLeader(targetCluster)
 	port, ok := constants.ServerPorts[targetLeader]
-	if !ok {
+	if targetLeader < 0 || !ok {
 		sm.restoreBalances(txID)
 		sm.unlockAccounts(in.Sender)
 		return &api.Reply{Result: false, ServerId: int32(s.id), Error: "UNKNOWN_PARTICIPANT"}, nil
@@ -865,7 +868,8 @@ func (s *ServerImpl) proposeLogWithPhase(phase string, txID string, sender strin
 	s.lock.Unlock()
 
 	logStore.append(record)
-	quorum := int((constants.MAX_NODES / 2) + 1)
+	clusterID := constants.ClusterOfServer(s.id)
+	quorum := constants.ClusterQuorum(clusterID)
 
 	ok := false
 	attempts := 0
@@ -1031,7 +1035,7 @@ func (sm *StateMachine) execCommitLogs() {
 		sender := logToApply.Txn.Sender
 		reciever := logToApply.Txn.Reciever
 
-		cluster := constants.ClusterOf(server.id)
+		cluster := constants.ClusterOfServer(server.id)
 		senderShard := shardOfAccount(sender)
 		receiverShard := shardOfAccount(reciever)
 
@@ -1089,7 +1093,7 @@ func (sm *StateMachine) execCommitLogs() {
 					walToDelete = logToApply.TxID
 				}
 			}
-			cluster := constants.ClusterOf(server.id)
+			cluster := constants.ClusterOfServer(server.id)
 			senderShard := shardOfAccount(sender)
 			receiverShard := shardOfAccount(reciever)
 			if senderShard != -1 && cluster == senderShard {
@@ -1373,7 +1377,7 @@ func (pm *PeerManager) initPeerConnections(currServer int) {
 		if serverId == currServer {
 			continue
 		}
-		if constants.ClusterOf(serverId) != constants.ClusterOf(currServer) {
+		if constants.ClusterOfServer(serverId) != constants.ClusterOfServer(currServer) {
 			continue
 		}
 
@@ -1686,9 +1690,11 @@ func (s *ServerImpl) startElection() {
 	s.lock.Unlock()
 	logs.Infof("Starting election with ballot <%d, %d>", prepareReq.BallotVal, prepareReq.ServerId)
 
-	quorum := int((constants.MAX_NODES / 2) + 1)
+	clusterID := constants.ClusterOfServer(s.id)
+	clusterSize := constants.ClusterSize(clusterID)
+	quorum := constants.ClusterQuorum(clusterID)
 	var promiseVotes int32 = 1
-	promiseChan := make(chan *api.PromiseResp, constants.MAX_NODES)
+	promiseChan := make(chan *api.PromiseResp, clusterSize)
 
 	for _, peer := range s.peerManager.peers {
 		go func(p *Peer) {
@@ -1955,7 +1961,8 @@ func (s *ServerImpl) redoConsensus() {
 	if !s.isServerRunning() {
 		return
 	}
-	quorum := int((constants.MAX_NODES / 2) + 1)
+	clusterID := constants.ClusterOfServer(s.id)
+	quorum := constants.ClusterQuorum(clusterID)
 	logStore.lock.Lock()
 	defer logStore.lock.Unlock()
 	for _, rec := range logStore.records {

@@ -29,7 +29,13 @@ func NewTestCaseManager() *TestCaseManager {
 }
 
 func (m *TestCaseManager) maxServerID() int {
-	return constants.MAX_NODES * constants.NUM_CLUSTERS
+	maxID := 0
+	for id := range constants.ServerPorts {
+		if id > maxID {
+			maxID = id
+		}
+	}
+	return maxID
 }
 
 func (m *TestCaseManager) Start(liveNodes []int) error {
