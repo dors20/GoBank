@@ -16,6 +16,7 @@ const (
 const MAX_CLIENTS = 10
 const MAX_NODES = 3
 const NUM_CLUSTERS = 3
+const MAX_INFLIGHT = 300
 
 // NETWORK CONFIG
 const LEADER_TIMEOUT_SECONDS = 200
@@ -30,7 +31,7 @@ const INITIAL_BALANCE = 10 // TODO spec mentions 10, using 100 for now easier to
 const NOOP = "no-op"
 
 // LOGGER
-const LOG_LEVEL = zap.InfoLevel
+const LOG_LEVEL = zap.WarnLevel
 
 // Can do base_Port+1
 // Port 9101 - 9110 reserved if we need multiple client instances

@@ -141,6 +141,34 @@ func (p *perfStats) finish() {
 	p.end = time.Now()
 }
 
+type clusterLimiter struct {
+	limit int
+	sem   map[int]chan struct{}
+}
+
+func newClusterLimiter(limit int) *clusterLimiter {
+	if limit <= 0 {
+		return &clusterLimiter{limit: 0}
+	}
+	sem := make(map[int]chan struct{}, constants.NUM_CLUSTERS)
+	for i := 0; i < constants.NUM_CLUSTERS; i++ {
+		sem[i] = make(chan struct{}, limit)
+	}
+	return &clusterLimiter{limit: limit, sem: sem}
+}
+
+func (c *clusterLimiter) acquire(cluster int) func() {
+	if c == nil || c.limit <= 0 {
+		return func() {}
+	}
+	ch, ok := c.sem[cluster]
+	if !ok {
+		return func() {}
+	}
+	ch <- struct{}{}
+	return func() { <-ch }
+}
+
 func main() {
 	logs = logger.InitLogger(1, false)
 	logs.Debug("Client Started")
@@ -471,6 +499,15 @@ func printReshardMapping(newMap map[int]int, prev map[int]int) {
 	}
 }
 func runSetWithManagerCLI(m *TestCaseManager, set InputSet, stats *perfStats) error {
+	return runSetWithManagerCLIInternal(m, set, stats, nil)
+}
+
+func runSetWithManagerCLIBench(m *TestCaseManager, set InputSet, stats *perfStats) error {
+	limiter := newClusterLimiter(constants.MAX_INFLIGHT)
+	return runSetWithManagerCLIInternal(m, set, stats, limiter)
+}
+
+func runSetWithManagerCLIInternal(m *TestCaseManager, set InputSet, stats *perfStats, limiter *clusterLimiter) error {
 	logs.Debug("Enter")
 	defer logs.Debug("Exit")
 
@@ -485,13 +522,18 @@ func runSetWithManagerCLI(m *TestCaseManager, set InputSet, stats *perfStats) er
 	for _, cmd := range set.Commands {
 		switch cmd.Type {
 		case CmdTransfer:
+			clusterID := clusterForAccountDynamic(cmd.Sender)
+			release := func() {}
+			if limiter != nil {
+				release = limiter.acquire(clusterID)
+			}
 			ts := baseTs + seq
 			seq++
 			c := cmd
 			wg.Add(1)
-			go func() {
+			go func(clusterID int) {
 				defer wg.Done()
-				clusterID := clusterForAccountDynamic(c.Sender)
+				defer release()
 				recordCrossShard(c.Sender, c.Receiver)
 				serverIDs, ok := constants.ClusterServers[clusterID]
 				if !ok || len(serverIDs) == 0 {
@@ -550,13 +592,18 @@ func runSetWithManagerCLI(m *TestCaseManager, set InputSet, stats *perfStats) er
 					return
 				}
 				logs.Warnf("Transfer txn in set %d from %d to %d amount=%d exhausted retries in cluster %d", set.SetNumber, c.Sender, c.Receiver, c.Amount, clusterID)
-			}()
+			}(clusterID)
 		case CmdRead:
+			clusterID := clusterForAccountDynamic(cmd.Account)
+			release := func() {}
+			if limiter != nil {
+				release = limiter.acquire(clusterID)
+			}
 			c := cmd
 			wg.Add(1)
-			go func() {
+			go func(clusterID int) {
 				defer wg.Done()
-				clusterID := clusterForAccountDynamic(c.Account)
+				defer release()
 				serverIDs, ok := constants.ClusterServers[clusterID]
 				if !ok || len(serverIDs) == 0 {
 					logs.Warnf("Read-only txn in set %d for account %d has no servers for cluster %d", set.SetNumber, c.Account, clusterID)
@@ -587,7 +634,7 @@ func runSetWithManagerCLI(m *TestCaseManager, set InputSet, stats *perfStats) er
 					return
 				}
 				logs.Warnf("Read-only txn in set %d for account %d exhausted retries in cluster %d", set.SetNumber, c.Account, clusterID)
-			}()
+			}(clusterID)
 		case CmdFail:
 			wg.Wait()
 			if err := m.FailNode(cmd.NodeID); err != nil {
@@ -720,6 +767,156 @@ func printPerformance(stats *perfStats) {
 	fmt.Printf("Performance: txns=%d throughput=%.2f txns/s avg-latency=%.3f ms max-latency=%.3f ms\n", stats.txnCount, throughput, avgLatencyMs, float64(stats.maxLatency.Milliseconds()))
 }
 
+type benchmarkConfig struct {
+	outPath      string
+	txns         int
+	readPct      int
+	crossPct     int
+	skew         float64
+	distribution string
+	seed         *int
+}
+
+func parseBenchmarkArgs(args []string) (benchmarkConfig, error) {
+	cfg := benchmarkConfig{
+		outPath:      "benchmark.csv",
+		txns:         1000,
+		readPct:      30,
+		crossPct:     30,
+		skew:         0,
+		distribution: "uniform",
+	}
+	for _, arg := range args {
+		parts := strings.SplitN(arg, "=", 2)
+		if len(parts) != 2 {
+			return cfg, fmt.Errorf("invalid benchmark arg: %s", arg)
+		}
+		key := strings.ToLower(parts[0])
+		val := parts[1]
+		switch key {
+		case "out":
+			if val == "" {
+				return cfg, fmt.Errorf("out path cannot be empty")
+			}
+			cfg.outPath = val
+		case "txns":
+			v, err := strconv.Atoi(val)
+			if err != nil {
+				return cfg, fmt.Errorf("invalid txns value: %v", err)
+			}
+			cfg.txns = v
+		case "read":
+			v, err := strconv.Atoi(val)
+			if err != nil {
+				return cfg, fmt.Errorf("invalid read value: %v", err)
+			}
+			cfg.readPct = v
+		case "cross":
+			v, err := strconv.Atoi(val)
+			if err != nil {
+				return cfg, fmt.Errorf("invalid cross value: %v", err)
+			}
+			cfg.crossPct = v
+		case "skew":
+			v, err := strconv.ParseFloat(val, 64)
+			if err != nil {
+				return cfg, fmt.Errorf("invalid skew value: %v", err)
+			}
+			cfg.skew = v
+		case "dist":
+			d := strings.ToLower(val)
+			if d != "uniform" && d != "skewed" {
+				return cfg, fmt.Errorf("dist must be uniform or skewed")
+			}
+			cfg.distribution = d
+		case "seed":
+			v, err := strconv.Atoi(val)
+			if err != nil {
+				return cfg, fmt.Errorf("invalid seed value: %v", err)
+			}
+			vCopy := v
+			cfg.seed = &vCopy
+		default:
+			return cfg, fmt.Errorf("unknown benchmark arg: %s", key)
+		}
+	}
+	if cfg.txns <= 0 {
+		cfg.txns = 1
+	}
+	if cfg.readPct < 0 {
+		cfg.readPct = 0
+	}
+	if cfg.readPct > 100 {
+		cfg.readPct = 100
+	}
+	if cfg.crossPct < 0 {
+		cfg.crossPct = 0
+	}
+	if cfg.crossPct > 100 {
+		cfg.crossPct = 100
+	}
+	if cfg.skew < 0 {
+		cfg.skew = 0
+	}
+	if cfg.skew > 1 {
+		cfg.skew = 1
+	}
+	return cfg, nil
+}
+
+func runBenchmarkGenerator(cfg benchmarkConfig) error {
+	args := []string{
+		"../benchmark_gen.py",
+		"--out", cfg.outPath,
+		"--txns", strconv.Itoa(cfg.txns),
+		"--read-pct", strconv.Itoa(cfg.readPct),
+		"--cross-pct", strconv.Itoa(cfg.crossPct),
+		"--skew", fmt.Sprintf("%.4f", cfg.skew),
+		"--distribution", cfg.distribution,
+	}
+	if cfg.seed != nil {
+		args = append(args, "--seed", strconv.Itoa(*cfg.seed))
+	}
+	cmd := exec.Command("python3", args...)
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+	return cmd.Run()
+}
+
+func runBenchmark(cfg benchmarkConfig) error {
+	fmt.Printf("Generating benchmark workload to %s\n", cfg.outPath)
+	if err := runBenchmarkGenerator(cfg); err != nil {
+		return err
+	}
+	sets, err := parseTestCasesForClient(cfg.outPath)
+	if err != nil {
+		return err
+	}
+	if len(sets) == 0 {
+		return fmt.Errorf("no benchmark sets generated")
+	}
+	reshardMapping = loadReshardMapping()
+	for _, set := range sets {
+		fmt.Printf("Running benchmark set %d (%d commands) with live nodes %v\n", set.SetNumber, len(set.Commands), set.LiveNodes)
+		m := NewTestCaseManager()
+		if err := m.Start(set.LiveNodes); err != nil {
+			return err
+		}
+		if err := m.initConnections(); err != nil {
+			m.Stop()
+			return err
+		}
+		stats := &perfStats{}
+		errRun := runSetWithManagerCLIBench(m, set, stats)
+		m.Stop()
+		if errRun != nil {
+			return errRun
+		}
+		printPerformance(stats)
+	}
+	return nil
+}
+
 func cliPrintLogs(m *TestCaseManager) {
 	logs.Debug("Enter")
 	defer logs.Debug("Exit")
@@ -765,7 +962,7 @@ func runCLI(testSets []InputSet) {
 	var stats *perfStats
 
 	fmt.Println("\n--- Project 3 Client ---")
-	fmt.Println("Commands: next, skip, printbalance <account>, printdb, printview, printlog, performance, exit, help")
+	fmt.Println("Commands: next, skip, benchmark, printbalance <account>, printdb, printview, printlog, performance, exit, help")
 
 	for {
 		fmt.Print("> ")
@@ -848,6 +1045,20 @@ func runCLI(testSets []InputSet) {
 			currentSet = nil
 			logs.Infof("Skipping set %d", set.SetNumber)
 			fmt.Printf("Skipping test set %d\n", set.SetNumber)
+		case "benchmark":
+			if manager != nil {
+				logs.Infof("Stopping previous set before benchmark")
+				manager.Stop()
+				manager = nil
+			}
+			cfg, err := parseBenchmarkArgs(fields[1:])
+			if err != nil {
+				fmt.Printf("Invalid benchmark args: %v\n", err)
+				continue
+			}
+			if err := runBenchmark(cfg); err != nil {
+				fmt.Printf("Benchmark failed: %v\n", err)
+			}
 		case "printbalance":
 			if len(fields) != 2 {
 				fmt.Println("Usage: printbalance <account>")
@@ -911,7 +1122,7 @@ func runCLI(testSets []InputSet) {
 			}
 			printReshardMapping(mapping, prev)
 		case "help":
-			fmt.Println("Commands: next, skip, printbalance <account>, printdb, printview, performance, exit, help")
+			fmt.Println("Commands: next, skip, benchmark, printbalance <account>, printdb, printview, performance, exit, help")
 		case "exit":
 			if manager != nil {
 				logs.Infof("Stopping manager on exit")
